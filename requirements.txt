@@ -1,0 +1,6 @@
+pandas>=2.2
+pyarrow>=15
+psycopg[binary]>=3.2
+streamlit>=1.40
+scikit-learn>=1.5
+xgboost>=2.1

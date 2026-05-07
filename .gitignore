@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Large datasets and third-party clones
+FreshRetailNet-50K/
+RetailForecast/
+data/
+*.parquet
+*.duckdb
+*.csv
+*.arrow
+*.npy
+*.npz
+
+# Generated model artifacts
+models/
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+
+# Docker/local database artifacts
+postgres-data/
+*.network-request
+*.network-response
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+.cache/
