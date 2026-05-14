@@ -11,6 +11,7 @@ from io import StringIO
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import psycopg
@@ -63,7 +64,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user", default=os.getenv("PGUSER", "warehouse"))
     parser.add_argument("--password", default=os.getenv("PGPASSWORD", "warehouse"))
     parser.add_argument("--batch-size", type=int, default=50_000)
-    parser.add_argument("--limit-rows-per-split", type=int, default=None, help="Useful for a fast demo load.")
+    parser.add_argument("--limit-rows-per-split", type=int, default=None, help="Legacy shortcut: cap both train and eval splits to the same row count.")
+    parser.add_argument("--train-limit-rows", type=int, default=None, help="Cap train.parquet daily rows. Omit to load the full train split.")
+    parser.add_argument("--eval-limit-rows", type=int, default=None, help="Cap eval.parquet daily rows. Omit to load the full eval split.")
+    parser.add_argument(
+        "--staging-sample-mode",
+        choices=["store-product-panel", "product-date-stratified", "date-stratified", "even", "head"],
+        default="product-date-stratified",
+        help="How to select rows when a split is capped. store-product-panel loads full histories for seeded store-product pairs and matched eval rows.",
+    )
+    parser.add_argument("--panel-seed", type=int, default=42, help="Random seed for store-product-panel sampling.")
     parser.add_argument("--reset", action="store_true", help="Truncate staging and warehouse tables before loading.")
     parser.add_argument("--schema-only", action="store_true", help="Apply schema and exit.")
     parser.add_argument("--load-hourly", action="store_true", help="Populate hourly fact table. Full data expands to about 116M rows.")
@@ -225,8 +235,218 @@ def copy_dataframe(conn: psycopg.Connection, table: str, columns: list[str], df:
     conn.commit()
 
 
-def iter_parquet_batches(path: Path, source_split: str, batch_size: int, limit_rows: int | None):
+def resolve_split_limit(args: argparse.Namespace, source_split: str) -> int | None:
+    specific_limit = args.train_limit_rows if source_split == "train" else args.eval_limit_rows
+    if specific_limit is not None:
+        return specific_limit
+    return args.limit_rows_per_split
+
+
+def validate_row_limit(name: str, limit_rows: int | None) -> None:
+    if limit_rows is not None and limit_rows <= 0:
+        raise ValueError(f"{name} must be greater than zero when provided")
+
+
+def even_sample_indices(total_rows: int, limit_rows: int) -> list[int] | None:
+    if limit_rows >= total_rows:
+        return None
+    return evenly_spaced_ranks(total_rows, limit_rows).tolist()
+
+
+def evenly_spaced_ranks(count: int, quota: int) -> np.ndarray:
+    if quota >= count:
+        return np.arange(count, dtype=np.int64)
+    return np.floor((np.arange(quota, dtype=np.float64) + 0.5) * count / quota).astype(np.int64)
+
+
+def proportional_group_quotas(group_counts: dict[object, int], limit_rows: int) -> dict[object, int]:
+    groups = sorted(group_counts)
+    if not groups:
+        return {}
+
+    if limit_rows >= sum(group_counts.values()):
+        return dict(group_counts)
+
+    quotas = {group: 0 for group in groups}
+    remaining = limit_rows
+    capacities = group_counts.copy()
+
+    if limit_rows >= len(groups):
+        for group in groups:
+            quotas[group] = 1
+            capacities[group] = max(group_counts[group] - 1, 0)
+        remaining -= len(groups)
+
+    total_capacity = sum(capacities.values())
+    if remaining <= 0 or total_capacity <= 0:
+        return quotas
+
+    fractional_parts: list[tuple[float, object]] = []
+    for group in groups:
+        raw_quota = remaining * capacities[group] / total_capacity
+        extra = min(int(np.floor(raw_quota)), capacities[group])
+        quotas[group] += extra
+        fractional_parts.append((raw_quota - extra, group))
+
+    assigned = sum(quotas.values())
+    leftover = limit_rows - assigned
+    for _, group in sorted(fractional_parts, key=lambda item: (-item[0], item[1])):
+        if leftover <= 0:
+            break
+        if quotas[group] < group_counts[group]:
+            quotas[group] += 1
+            leftover -= 1
+
+    if leftover > 0:
+        for group in groups:
+            if leftover <= 0:
+                break
+            available = group_counts[group] - quotas[group]
+            take = min(available, leftover)
+            quotas[group] += take
+            leftover -= take
+
+    return quotas
+
+
+def batch_group_keys(batch: pa.RecordBatch, columns: list[str]) -> list[object]:
+    df = pa.Table.from_batches([batch]).select(columns).to_pandas()
+    if "dt" in df.columns:
+        df["dt"] = pd.to_datetime(df["dt"]).dt.date
+    if len(columns) == 1:
+        return df[columns[0]].tolist()
+    return list(df.itertuples(index=False, name=None))
+
+
+def count_groups(path: Path, batch_size: int, columns: list[str]) -> dict[object, int]:
     parquet_file = pq.ParquetFile(path)
+    counts: dict[object, int] = {}
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        for group in batch_group_keys(batch, columns):
+            counts[group] = counts.get(group, 0) + 1
+    return counts
+
+
+def stratified_sample_indices(path: Path, batch_size: int, limit_rows: int, columns: list[str]) -> list[int] | None:
+    parquet_file = pq.ParquetFile(path)
+    total_rows = parquet_file.metadata.num_rows
+    if limit_rows >= total_rows:
+        return None
+
+    group_counts = count_groups(path, batch_size, columns)
+    quotas = proportional_group_quotas(group_counts, limit_rows)
+    selected_ranks = {
+        group: set(evenly_spaced_ranks(count, quotas[group]).tolist())
+        for group, count in group_counts.items()
+        if quotas.get(group, 0) > 0
+    }
+    seen_by_group = {group: 0 for group in group_counts}
+    selected_indices: list[int] = []
+    row_offset = 0
+
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        groups = batch_group_keys(batch, columns)
+        for local_index, group in enumerate(groups):
+            rank = seen_by_group[group]
+            if rank in selected_ranks.get(group, set()):
+                selected_indices.append(row_offset + local_index)
+            seen_by_group[group] = rank + 1
+        row_offset += len(groups)
+
+    if len(selected_indices) != limit_rows:
+        raise RuntimeError(f"Expected {limit_rows:,} sampled rows from {path.name}, got {len(selected_indices):,}")
+    return selected_indices
+
+
+def date_stratified_sample_indices(path: Path, batch_size: int, limit_rows: int) -> list[int] | None:
+    return stratified_sample_indices(path, batch_size, limit_rows, ["dt"])
+
+
+def product_date_stratified_sample_indices(path: Path, batch_size: int, limit_rows: int) -> list[int] | None:
+    return stratified_sample_indices(path, batch_size, limit_rows, ["dt", "product_id"])
+
+
+def count_store_product_pairs(path: Path, batch_size: int) -> dict[tuple[int, int], int]:
+    parquet_file = pq.ParquetFile(path)
+    counts: dict[tuple[int, int], int] = {}
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=["store_id", "product_id"]):
+        df = pa.Table.from_batches([batch]).to_pandas()
+        for store_id, product_id in df[["store_id", "product_id"]].itertuples(index=False, name=None):
+            pair = (int(store_id), int(product_id))
+            counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+
+def select_store_product_panel(path: Path, batch_size: int, target_rows: int | None, seed: int) -> tuple[frozenset[tuple[int, int]], int]:
+    pair_counts = count_store_product_pairs(path, batch_size)
+    pairs = list(pair_counts)
+    if not pairs:
+        return frozenset(), 0
+    if target_rows is None:
+        return frozenset(pairs), sum(pair_counts.values())
+
+    rng = np.random.default_rng(seed)
+    shuffled_indices = rng.permutation(len(pairs))
+    selected: list[tuple[int, int]] = []
+    selected_rows = 0
+    for pair_index in shuffled_indices:
+        pair = pairs[int(pair_index)]
+        next_rows = selected_rows + pair_counts[pair]
+        if selected and abs(target_rows - selected_rows) <= abs(target_rows - next_rows):
+            break
+        selected.append(pair)
+        selected_rows = next_rows
+        if selected_rows >= target_rows:
+            break
+
+    return frozenset(selected), selected_rows
+
+
+def sampled_row_indices(path: Path, batch_size: int, limit_rows: int | None, sample_mode: str) -> list[int] | None:
+    if limit_rows is None or sample_mode in {"head", "store-product-panel"}:
+        return None
+    parquet_file = pq.ParquetFile(path)
+    total_rows = parquet_file.metadata.num_rows
+    if sample_mode == "even":
+        return even_sample_indices(total_rows, limit_rows)
+    if sample_mode == "date-stratified":
+        return date_stratified_sample_indices(path, batch_size, limit_rows)
+    if sample_mode == "product-date-stratified":
+        return product_date_stratified_sample_indices(path, batch_size, limit_rows)
+    raise ValueError(f"Unsupported staging sample mode: {sample_mode}")
+
+
+def take_selected_rows(table: pa.Table, selected_indices: list[int], start_row: int, pointer: int) -> tuple[pa.Table | None, int]:
+    end_row = start_row + table.num_rows
+    relative_indices: list[int] = []
+    while pointer < len(selected_indices) and selected_indices[pointer] < end_row:
+        if selected_indices[pointer] >= start_row:
+            relative_indices.append(selected_indices[pointer] - start_row)
+        pointer += 1
+    if not relative_indices:
+        return None, pointer
+    return table.take(pa.array(relative_indices, type=pa.int64())), pointer
+
+
+def filter_store_product_panel(df: pd.DataFrame, panel_pairs: frozenset[tuple[int, int]] | None) -> pd.DataFrame:
+    if panel_pairs is None:
+        return df
+    mask = [(int(store_id), int(product_id)) in panel_pairs for store_id, product_id in zip(df["store_id"], df["product_id"])]
+    return df.loc[mask].copy()
+
+
+def iter_parquet_batches(
+    path: Path,
+    source_split: str,
+    batch_size: int,
+    limit_rows: int | None,
+    sample_mode: str,
+    panel_pairs: frozenset[tuple[int, int]] | None = None,
+):
+    parquet_file = pq.ParquetFile(path)
+    selected_indices = sampled_row_indices(path, batch_size, limit_rows, sample_mode)
+    selected_pointer = 0
+    row_offset = 0
     loaded = 0
 
     for batch in parquet_file.iter_batches(batch_size=batch_size):
@@ -234,12 +454,22 @@ def iter_parquet_batches(path: Path, source_split: str, batch_size: int, limit_r
             break
 
         table = pa.Table.from_batches([batch])
-        if limit_rows is not None:
+        if selected_indices is not None:
+            table, selected_pointer = take_selected_rows(table, selected_indices, row_offset, selected_pointer)
+            row_offset += batch.num_rows
+            if table is None:
+                continue
+        elif limit_rows is not None:
             remaining = limit_rows - loaded
             if table.num_rows > remaining:
                 table = table.slice(0, remaining)
+            row_offset += batch.num_rows
+        else:
+            row_offset += batch.num_rows
 
-        df = table.to_pandas()
+        df = filter_store_product_panel(table.to_pandas(), panel_pairs)
+        if df.empty:
+            continue
         df.insert(0, "source_split", source_split)
         df["dt"] = pd.to_datetime(df["dt"]).dt.strftime("%Y-%m-%d")
         df["hours_sale"] = df["hours_sale"].map(pg_float_array)
@@ -250,13 +480,36 @@ def iter_parquet_batches(path: Path, source_split: str, batch_size: int, limit_r
         yield df, loaded
 
 
-def load_staging(conn: psycopg.Connection, data_dir: Path, batch_size: int, limit_rows: int | None) -> None:
+def load_staging(conn: psycopg.Connection, data_dir: Path, batch_size: int, args: argparse.Namespace) -> None:
+    panel_pairs: frozenset[tuple[int, int]] | None = None
+    if args.staging_sample_mode == "store-product-panel":
+        target_rows = resolve_split_limit(args, "train")
+        panel_pairs, selected_train_rows = select_store_product_panel(data_dir / "train.parquet", batch_size, target_rows, args.panel_seed)
+        if not panel_pairs:
+            raise RuntimeError("No store-product pairs found for panel sampling.")
+        if args.eval_limit_rows is not None:
+            print("store-product-panel mode ignores --eval-limit-rows and loads eval rows for the selected train panel")
+        target_text = "full train split" if target_rows is None else f"target {target_rows:,} train rows"
+        print(
+            f"selected store-product panel with seed {args.panel_seed}: "
+            f"{len(panel_pairs):,} pairs, {selected_train_rows:,} train rows ({target_text})"
+        )
+
     for source_split in ("train", "eval"):
         path = data_dir / f"{source_split}.parquet"
         if not path.exists():
             raise FileNotFoundError(path)
+        if panel_pairs is not None:
+            limit_rows = None
+            print(f"loading staging {source_split}: selected store-product panel")
+        else:
+            limit_rows = resolve_split_limit(args, source_split)
+            if limit_rows is None:
+                print(f"loading staging {source_split}: full split")
+            else:
+                print(f"loading staging {source_split}: {limit_rows:,} row cap using {args.staging_sample_mode} sampling")
 
-        for df, loaded in iter_parquet_batches(path, source_split, batch_size, limit_rows):
+        for df, loaded in iter_parquet_batches(path, source_split, batch_size, limit_rows, args.staging_sample_mode, panel_pairs):
             copy_dataframe(conn, "staging.fresh_retail_observation_day", STAGING_COLUMNS, df)
             print(f"loaded staging {source_split}: {loaded:,} rows")
 
@@ -503,6 +756,9 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     schema_file = Path(args.schema_file)
     config = db_config_from_args(args)
+    validate_row_limit("--limit-rows-per-split", args.limit_rows_per_split)
+    validate_row_limit("--train-limit-rows", args.train_limit_rows)
+    validate_row_limit("--eval-limit-rows", args.eval_limit_rows)
     hourly_start_date = parse_date_arg(args.hourly_start_date)
     hourly_end_date = parse_date_arg(args.hourly_end_date)
     if hourly_start_date and hourly_end_date and hourly_start_date > hourly_end_date:
@@ -524,7 +780,7 @@ def main() -> None:
             print("skipping staging load; reusing existing staging table")
         else:
             print("loading merged staging table")
-            load_staging(conn, data_dir, args.batch_size, args.limit_rows_per_split)
+            load_staging(conn, data_dir, args.batch_size, args)
 
         print("populating dimensions and daily fact")
         populate_dimensions_and_daily_fact(conn)
