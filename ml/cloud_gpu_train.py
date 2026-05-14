@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+from typing import Any, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -91,6 +93,14 @@ PREDICTION_COLUMNS = [
     "prediction_upper_bound",
 ]
 
+RUN_STARTED_AT = perf_counter()
+T = TypeVar("T")
+
+
+def log(message: str) -> None:
+    elapsed = perf_counter() - RUN_STARTED_AT
+    print(f"[+{elapsed:,.1f}s] {message}", flush=True)
+
 WAREHOUSE_COLUMNS = [
     "date_key",
     "full_date",
@@ -142,6 +152,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warehouse-limit-rows", type=int, default=None)
     parser.add_argument("--warehouse-no-order", action="store_true", help="Skip ORDER BY for faster direct PostgreSQL reads.")
     parser.add_argument("--warehouse-chunk-size", type=int, default=250_000)
+    parser.add_argument("--warehouse-workers", type=int, default=1, help="Parallel PostgreSQL readers for direct warehouse mode. Best used with date-filtered or full-date loads.")
     parser.add_argument("--output-dir", default="cloud_outputs")
     parser.add_argument("--model-type", choices=["xgboost", "catboost"], default="xgboost")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -173,16 +184,22 @@ def connect(args: argparse.Namespace) -> psycopg.Connection:
     )
 
 
-def build_warehouse_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...]]:
+def build_warehouse_filter_clauses(
+    args: argparse.Namespace,
+    *,
+    include_date_filters: bool = True,
+    extra_clauses: list[str] | None = None,
+    extra_params: list[Any] | None = None,
+) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
     if args.warehouse_source_split:
         clauses.append("source_split = %s")
         params.append(args.warehouse_source_split)
-    if args.warehouse_start_date:
+    if include_date_filters and args.warehouse_start_date:
         clauses.append("full_date >= %s")
         params.append(args.warehouse_start_date)
-    if args.warehouse_end_date:
+    if include_date_filters and args.warehouse_end_date:
         clauses.append("full_date <= %s")
         params.append(args.warehouse_end_date)
     if args.warehouse_first_category_id is not None:
@@ -199,11 +216,34 @@ def build_warehouse_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...
             raise ValueError("--warehouse-sample-rate must be in the range (0, 1].")
         clauses.append("random() < %s")
         params.append(args.warehouse_sample_rate)
+    if extra_clauses:
+        clauses.extend(extra_clauses)
+    if extra_params:
+        params.extend(extra_params)
+
+    return clauses, params
+
+
+def build_warehouse_query(
+    args: argparse.Namespace,
+    *,
+    include_limit: bool = True,
+    include_order: bool = True,
+    include_date_filters: bool = True,
+    extra_clauses: list[str] | None = None,
+    extra_params: list[Any] | None = None,
+) -> tuple[str, tuple[Any, ...]]:
+    clauses, params = build_warehouse_filter_clauses(
+        args,
+        include_date_filters=include_date_filters,
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+    )
 
     where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
-    order_sql = "" if args.warehouse_no_order else "ORDER BY date_key, source_split, store_key, product_key, time_key"
+    order_sql = "" if args.warehouse_no_order or not include_order else "ORDER BY date_key, source_split, store_key, product_key, time_key"
     limit_sql = ""
-    if args.warehouse_limit_rows is not None:
+    if include_limit and args.warehouse_limit_rows is not None:
         limit_sql = "LIMIT %s"
         params.append(args.warehouse_limit_rows)
 
@@ -219,7 +259,110 @@ def build_warehouse_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...
     )
 
 
+def split_evenly(items: list[T], parts: int) -> list[list[T]]:
+    if parts <= 1 or len(items) <= 1:
+        return [items]
+    chunk_size = max(1, (len(items) + parts - 1) // parts)
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def list_partition_dates(args: argparse.Namespace) -> list[Any]:
+    clauses, params = build_warehouse_filter_clauses(args)
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    sql = f"""
+        SELECT DISTINCT full_date
+        FROM dw.v_model_training_features_hourly
+        {where_sql}
+        ORDER BY full_date
+    """
+    with connect(args) as conn, conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return [row[0] for row in cur.fetchall()]
+
+
+def load_warehouse_partition(args: argparse.Namespace, partition_dates: list[Any], worker_index: int) -> pd.DataFrame:
+    if not partition_dates:
+        return pd.DataFrame(columns=WAREHOUSE_COLUMNS)
+    start_date = partition_dates[0]
+    end_date = partition_dates[-1]
+    sql, params = build_warehouse_query(
+        args,
+        include_limit=False,
+        include_order=False,
+        include_date_filters=False,
+        extra_clauses=["full_date >= %s", "full_date <= %s"],
+        extra_params=[start_date, end_date],
+    )
+    chunks: list[pd.DataFrame] = []
+    total_rows = 0
+    with connect(args) as conn, conn.cursor(name=f"cloud_training_features_{worker_index}") as cur:
+        cur.itersize = args.warehouse_chunk_size
+        cur.execute(sql, params)
+        while True:
+            rows = cur.fetchmany(args.warehouse_chunk_size)
+            if not rows:
+                break
+            columns = [desc.name for desc in cur.description]
+            chunk = pd.DataFrame(rows, columns=columns)
+            chunks.append(chunk)
+            total_rows += len(chunk)
+            log(f"worker {worker_index} loaded {total_rows:,} rows for {start_date}..{end_date}")
+    if not chunks:
+        return pd.DataFrame(columns=WAREHOUSE_COLUMNS)
+    return pd.concat(chunks, ignore_index=True)
+
+
+def load_features_from_warehouse_parallel(args: argparse.Namespace) -> pd.DataFrame:
+    if args.warehouse_limit_rows is not None:
+        log("warehouse parallel loading disabled because --warehouse-limit-rows requires a global limit")
+        return load_features_from_warehouse(args)
+
+    partition_dates = list_partition_dates(args)
+    if not partition_dates:
+        raise RuntimeError("No warehouse feature rows found. Check hourly facts and filters.")
+    partitions = [dates for dates in split_evenly(partition_dates, args.warehouse_workers) if dates]
+    if len(partitions) <= 1:
+        log("warehouse parallel loading skipped because only one date partition was available")
+        return load_features_from_warehouse(args)
+
+    log(f"loading warehouse features with {len(partitions)} parallel workers across {len(partition_dates)} dates")
+    frames: list[pd.DataFrame] = []
+    with ThreadPoolExecutor(max_workers=len(partitions)) as executor:
+        futures = {
+            executor.submit(load_warehouse_partition, args, partition_dates_chunk, index): index
+            for index, partition_dates_chunk in enumerate(partitions, start=1)
+        }
+        for future in as_completed(futures):
+            worker_index = futures[future]
+            frame = future.result()
+            frames.append(frame)
+            log(f"worker {worker_index} finished with {len(frame):,} rows")
+
+    if not frames:
+        raise RuntimeError("No warehouse feature rows found. Check hourly facts and filters.")
+    result = pd.concat(frames, ignore_index=True)
+    if not args.warehouse_no_order:
+        log("sorting concatenated parallel warehouse rows")
+        result = result.sort_values(["date_key", "source_split", "store_key", "product_key", "time_key"]).reset_index(drop=True)
+    log(f"loaded {len(result):,} total feature rows from parallel warehouse reads")
+    return result
+
+
 def load_features_from_warehouse(args: argparse.Namespace) -> pd.DataFrame:
+    has_size_filter = any(
+        [
+            args.warehouse_source_split,
+            args.warehouse_start_date,
+            args.warehouse_end_date,
+            args.warehouse_first_category_id is not None,
+            args.warehouse_store_id is not None,
+            args.warehouse_product_id is not None,
+            args.warehouse_sample_rate is not None,
+            args.warehouse_limit_rows is not None,
+        ]
+    )
+    if not has_size_filter:
+        log("warning: no warehouse filters set; loading every hourly feature row can take a long time")
     sql, params = build_warehouse_query(args)
     chunks: list[pd.DataFrame] = []
     total_rows = 0
@@ -235,17 +378,20 @@ def load_features_from_warehouse(args: argparse.Namespace) -> pd.DataFrame:
                 chunk = pd.DataFrame(rows, columns=columns)
                 chunks.append(chunk)
                 total_rows += len(chunk)
-                print(f"loaded {total_rows:,} feature rows from warehouse")
+                log(f"loaded {total_rows:,} feature rows from warehouse")
     if not chunks:
         raise RuntimeError("No warehouse feature rows found. Check hourly facts and filters.")
+    log(f"concatenating {len(chunks):,} warehouse chunks")
     return pd.concat(chunks, ignore_index=True)
 
 
 def load_features(args: argparse.Namespace) -> pd.DataFrame:
     if args.features:
-        print(f"loading features from {args.features}")
+        log(f"loading features from {args.features}")
         return pd.read_parquet(args.features)
-    print("loading features directly from PostgreSQL warehouse")
+    log("loading features directly from PostgreSQL warehouse")
+    if args.warehouse_workers > 1:
+        return load_features_from_warehouse_parallel(args)
     return load_features_from_warehouse(args)
 
 
@@ -286,6 +432,8 @@ def merge_rate(
 
 
 def add_advanced_features(features: pd.DataFrame) -> pd.DataFrame:
+    started_at = perf_counter()
+    log(f"engineering advanced features for {len(features):,} rows")
     result = features.copy()
     result["hour_sin"] = np.sin(2 * np.pi * result["hour_of_day"].astype(float) / 24.0)
     result["hour_cos"] = np.cos(2 * np.pi * result["hour_of_day"].astype(float) / 24.0)
@@ -302,6 +450,7 @@ def add_advanced_features(features: pd.DataFrame) -> pd.DataFrame:
     non_stockout_train = result[(result["source_split"] == "train") & (result["is_trainable_demand_observation"].astype(bool))]
     train_all = result[result["source_split"] == "train"]
     global_mean = float(non_stockout_train["observed_sales_amount"].mean()) if not non_stockout_train.empty else 0.0
+    log(f"advanced feature reference rows: {len(non_stockout_train):,} trainable rows; {len(train_all):,} total train rows")
 
     demand_groups = [
         (["store_id", "product_id", "hour_of_day"], "store_product_hour_mean", "store_product_hour_count"),
@@ -315,10 +464,13 @@ def add_advanced_features(features: pd.DataFrame) -> pd.DataFrame:
         (["hour_of_day"], "global_hour_mean", "global_hour_count"),
         (["day_of_week"], "global_dow_mean", "global_dow_count"),
     ]
-    for keys, mean_column, count_column in demand_groups:
+    for index, (keys, mean_column, count_column) in enumerate(demand_groups, start=1):
+        group_started_at = perf_counter()
+        log(f"building demand prior {index}/{len(demand_groups)}: {mean_column} by {', '.join(keys)}")
         result = merge_mean_count(result, non_stockout_train, keys, mean_column, count_column)
         result[f"{count_column}_log1p"] = np.log1p(pd.to_numeric(result[count_column], errors="coerce").fillna(0))
         result = result.drop(columns=[count_column])
+        log(f"finished {mean_column} in {perf_counter() - group_started_at:,.1f}s")
 
     result["baseline_demand_prior"] = (
         result["store_product_hour_mean"]
@@ -339,13 +491,17 @@ def add_advanced_features(features: pd.DataFrame) -> pd.DataFrame:
         (["product_id"], "product_stockout_rate"),
         (["first_category_id"], "category_stockout_rate"),
     ]
-    for keys, rate_column in stockout_groups:
+    for index, (keys, rate_column) in enumerate(stockout_groups, start=1):
+        group_started_at = perf_counter()
+        log(f"building stockout prior {index}/{len(stockout_groups)}: {rate_column} by {', '.join(keys)}")
         result = merge_rate(result, train_all, keys, rate_column)
+        log(f"finished {rate_column} in {perf_counter() - group_started_at:,.1f}s")
 
     for column in ADVANCED_FEATURE_COLUMNS:
         if column not in result.columns:
             result[column] = 0
         result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+    log(f"advanced feature engineering completed in {perf_counter() - started_at:,.1f}s")
     return result
 
 
@@ -356,6 +512,7 @@ def sample_if_needed(df: pd.DataFrame, max_rows: int | None, random_state: int) 
 
 
 def train_model(args: argparse.Namespace, train_df: pd.DataFrame, feature_columns: list[str]):
+    log("building training matrix")
     x_train = feature_matrix(train_df, feature_columns)
     y_train = pd.to_numeric(train_df["target_observed_sales_amount"], errors="coerce").fillna(train_df["observed_sales_amount"]).astype(float)
 
@@ -394,7 +551,10 @@ def train_model(args: argparse.Namespace, train_df: pd.DataFrame, feature_column
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
 
+    log(f"fitting {args.model_type} with {len(train_df):,} rows and {len(feature_columns):,} features")
+    fit_started_at = perf_counter()
     model.fit(x_train, y_train)
+    log(f"model fit completed in {perf_counter() - fit_started_at:,.1f}s")
     return model
 
 
@@ -480,7 +640,7 @@ def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, bat
                 writer = pq.ParquetWriter(output_path, arrow_table.schema, compression="zstd")
             writer.write_table(arrow_table)
             total_rows += len(predictions)
-            print(f"predicted {total_rows:,} rows")
+        log(f"predicted {total_rows:,} rows")
     finally:
         if writer is not None:
             writer.close()
@@ -494,14 +654,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     features = load_features(args)
+    log(f"loaded {len(features):,} total feature rows")
     if args.max_predict_rows is not None:
+        log(f"applying prediction smoke-test cap: {args.max_predict_rows:,} rows")
         features = features.sort_values(["date_key", "source_split", "store_key", "product_key", "time_key"]).head(args.max_predict_rows).reset_index(drop=True)
 
     feature_columns = BASE_FEATURE_COLUMNS.copy()
     if args.disable_advanced_features:
-        print("advanced feature engineering disabled")
+        log("advanced feature engineering disabled")
     else:
-        print("adding train-only historical demand and stockout features")
+        log("adding train-only historical demand and stockout features")
         features = add_advanced_features(features)
         feature_columns += ADVANCED_FEATURE_COLUMNS
 
@@ -513,29 +675,32 @@ def main() -> None:
     if train_df.empty:
         raise RuntimeError("No trainable rows found. Export full features, not `--trainable-only` eval data.")
     if eval_df.empty:
-        print("no eval rows found; using a train sample for evaluation")
+        log("no eval rows found; using a train sample for evaluation")
         eval_df = train_df.sample(min(len(train_df), 50_000), random_state=args.random_state).reset_index(drop=True)
 
-    print(f"training rows: {len(train_df):,}")
-    print(f"evaluation rows: {len(eval_df):,}")
-    print(f"feature columns: {len(feature_columns):,}")
-    print(f"training {args.model_type} on {args.device}")
+    log(f"training rows: {len(train_df):,}")
+    log(f"evaluation rows: {len(eval_df):,}")
+    log(f"feature columns: {len(feature_columns):,}")
+    log(f"training {args.model_type} on {args.device}")
     model = train_model(args, train_df, feature_columns)
 
+    log("evaluating uncalibrated model")
     uncalibrated_metrics = evaluate_model(model, eval_df, feature_columns)
     calibration_factor = 1.0
     if not args.disable_eval_calibration:
+        log("computing eval calibration factor")
         calibration_factor = compute_calibration_factor(model, eval_df, feature_columns)
+    log("evaluating final calibrated model")
     metrics = evaluate_model(model, eval_df, feature_columns, calibration_factor)
     segments = evaluate_segments(model, eval_df, feature_columns, calibration_factor)
 
-    print("uncalibrated metrics")
+    log("uncalibrated metrics")
     for key, value in uncalibrated_metrics.items():
-        print(f"uncalibrated_{key}: {value:.6f}")
-    print(f"calibration_factor: {calibration_factor:.6f}")
-    print("final metrics")
+        log(f"uncalibrated_{key}: {value:.6f}")
+    log(f"calibration_factor: {calibration_factor:.6f}")
+    log("final metrics")
     for key, value in metrics.items():
-        print(f"{key}: {value:.6f}")
+        log(f"{key}: {value:.6f}")
 
     prediction_path = output_dir / f"{args.model_name}_{model_version}_predictions.parquet"
     metrics_path = output_dir / f"{args.model_name}_{model_version}_metrics.json"
@@ -566,9 +731,9 @@ def main() -> None:
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    print(f"wrote predictions: {prediction_path}")
-    print(f"wrote metrics: {metrics_path}")
-    print(f"wrote metadata: {metadata_path}")
+    log(f"wrote predictions: {prediction_path}")
+    log(f"wrote metrics: {metrics_path}")
+    log(f"wrote metadata: {metadata_path}")
 
 
 if __name__ == "__main__":

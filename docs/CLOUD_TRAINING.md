@@ -71,6 +71,7 @@ If PostgreSQL and GPU training are both on Colab, you can skip the feature parqu
 uv run python ml/cloud_gpu_train.py \
   --warehouse-start-date 2024-06-01 \
   --warehouse-end-date 2024-07-02 \
+  --warehouse-workers 4 \
   --warehouse-no-order \
   --output-dir cloud_outputs \
   --device cuda \
@@ -92,6 +93,10 @@ or:
 ```bash
 --warehouse-limit-rows 5000000
 ```
+
+If you omit all warehouse filters, the script reads every hourly feature row. Metrics are printed only after advanced feature engineering and model training finish. On millions of rows, the `adding train-only historical demand and stockout features` stage can take several minutes because it builds demand priors across store/product/hour/category groups.
+
+`--warehouse-workers` parallelizes PostgreSQL reads by date partitions. It helps direct warehouse loading, but it does not reduce the later in-memory feature engineering cost. When `--warehouse-limit-rows` is set, the script falls back to a single reader so the limit stays global.
 
 ## 4. Kaggle: Train On GPU
 
