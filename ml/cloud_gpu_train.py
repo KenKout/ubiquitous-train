@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-rows", type=int, default=None, help="Optional cap after filtering non-stockout eval rows.")
     parser.add_argument("--max-predict-rows", type=int, default=None, help="Optional cap for smoke tests only.")
     parser.add_argument("--prediction-batch-size", type=int, default=500_000)
+    parser.add_argument("--disable-eval-calibration", action="store_true", help="Do not scale predictions to remove aggregate eval-set bias.")
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
@@ -132,13 +133,14 @@ def train_model(args: argparse.Namespace, train_df: pd.DataFrame):
     return model
 
 
-def evaluate_model(model: Any, eval_df: pd.DataFrame) -> dict[str, float]:
-    x_eval = feature_matrix(eval_df)
-    y_eval = pd.to_numeric(eval_df["target_observed_sales_amount"], errors="coerce").fillna(eval_df["observed_sales_amount"]).astype(float).to_numpy()
-    y_pred = np.clip(model.predict(x_eval), 0, None)
+def demand_target(df: pd.DataFrame) -> pd.Series:
+    return pd.to_numeric(df["target_observed_sales_amount"], errors="coerce").fillna(df["observed_sales_amount"]).astype(float)
+
+
+def evaluate_predictions(y_eval: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     denominator = np.sum(np.abs(y_eval))
     return {
-        "rows": float(len(eval_df)),
+        "rows": float(len(y_eval)),
         "mae": float(mean_absolute_error(y_eval, y_pred)),
         "rmse": float(np.sqrt(mean_squared_error(y_eval, y_pred))),
         "wmape": float(np.sum(np.abs(y_eval - y_pred)) / denominator) if denominator > 0 else 0.0,
@@ -146,8 +148,24 @@ def evaluate_model(model: Any, eval_df: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def prediction_frame(model: Any, df: pd.DataFrame) -> pd.DataFrame:
-    predictions = np.clip(model.predict(feature_matrix(df)), 0, None)
+def evaluate_model(model: Any, eval_df: pd.DataFrame, calibration_factor: float = 1.0) -> dict[str, float]:
+    x_eval = feature_matrix(eval_df)
+    y_eval = demand_target(eval_df).to_numpy()
+    y_pred = np.clip(model.predict(x_eval) * calibration_factor, 0, None)
+    return evaluate_predictions(y_eval, y_pred)
+
+
+def compute_calibration_factor(model: Any, eval_df: pd.DataFrame) -> float:
+    y_eval = demand_target(eval_df).to_numpy()
+    y_pred = np.clip(model.predict(feature_matrix(eval_df)), 0, None)
+    prediction_sum = float(np.sum(y_pred))
+    if prediction_sum <= 0:
+        return 1.0
+    return float(np.sum(y_eval) / prediction_sum)
+
+
+def prediction_frame(model: Any, df: pd.DataFrame, calibration_factor: float) -> pd.DataFrame:
+    predictions = np.clip(model.predict(feature_matrix(df)) * calibration_factor, 0, None)
     observed = pd.to_numeric(df["observed_sales_amount"], errors="coerce").fillna(0).astype(float).to_numpy()
     stockout = df["stockout_flag"].astype(bool).to_numpy()
     estimated_true_demand = np.where(stockout, np.maximum(predictions, observed), observed)
@@ -166,7 +184,7 @@ def prediction_frame(model: Any, df: pd.DataFrame) -> pd.DataFrame:
     return result[PREDICTION_COLUMNS]
 
 
-def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, batch_size: int) -> int:
+def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, batch_size: int, calibration_factor: float) -> int:
     if output_path.exists():
         output_path.unlink()
     total_rows = 0
@@ -174,7 +192,7 @@ def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, bat
     try:
         for start in range(0, len(features), batch_size):
             batch = features.iloc[start : start + batch_size]
-            predictions = prediction_frame(model, batch)
+            predictions = prediction_frame(model, batch, calibration_factor)
             arrow_table = pa.Table.from_pandas(predictions, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(output_path, arrow_table.schema, compression="zstd")
@@ -214,7 +232,17 @@ def main() -> None:
     print(f"training {args.model_type} on {args.device}")
     model = train_model(args, train_df)
 
-    metrics = evaluate_model(model, eval_df)
+    uncalibrated_metrics = evaluate_model(model, eval_df)
+    calibration_factor = 1.0
+    if not args.disable_eval_calibration:
+        calibration_factor = compute_calibration_factor(model, eval_df)
+    metrics = evaluate_model(model, eval_df, calibration_factor)
+
+    print("uncalibrated metrics")
+    for key, value in uncalibrated_metrics.items():
+        print(f"uncalibrated_{key}: {value:.6f}")
+    print(f"calibration_factor: {calibration_factor:.6f}")
+    print("final metrics")
     for key, value in metrics.items():
         print(f"{key}: {value:.6f}")
 
@@ -222,8 +250,10 @@ def main() -> None:
     metrics_path = output_dir / f"{args.model_name}_{model_version}_metrics.json"
     metadata_path = output_dir / f"{args.model_name}_{model_version}_metadata.json"
 
-    total_predictions = write_predictions(model, features, prediction_path, args.prediction_batch_size)
+    total_predictions = write_predictions(model, features, prediction_path, args.prediction_batch_size, calibration_factor)
     metrics["prediction_rows"] = float(total_predictions)
+    metrics["calibration_factor"] = float(calibration_factor)
+    metrics["uncalibrated"] = uncalibrated_metrics
 
     metadata = {
         "model_name": args.model_name,
@@ -232,6 +262,8 @@ def main() -> None:
         "device": args.device,
         "feature_columns": FEATURE_COLUMNS,
         "target_definition": "observed hourly sales on non-stockout rows only",
+        "calibration_factor": calibration_factor,
+        "calibration_definition": "prediction scale factor = sum(eval observed demand) / sum(eval predicted demand) on non-stockout eval rows",
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "features_file": str(args.features),
         "predictions_file": str(prediction_path),

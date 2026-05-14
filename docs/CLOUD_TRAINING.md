@@ -49,7 +49,13 @@ Kaggle setup:
 ```bash
 git clone https://github.com/KenKout/ubiquitous-train.git
 cd ubiquitous-train
-python -m pip install -U xgboost scikit-learn pyarrow pandas
+python -m pip install -U numpy pandas pyarrow scikit-learn xgboost
+```
+
+If using `uv`, quote version constraints because `>` can be interpreted by the shell:
+
+```bash
+uv pip install --system 'numpy>=1.26' pandas pyarrow scikit-learn xgboost
 ```
 
 Example Kaggle command:
@@ -66,6 +72,26 @@ python ml/cloud_gpu_train.py \
   --max-depth 8 \
   --learning-rate 0.05
 ```
+
+By default, `ml/cloud_gpu_train.py` calibrates prediction volume on non-stockout eval rows:
+
+```text
+calibration_factor = sum(eval observed demand) / sum(eval predicted demand)
+```
+
+This is useful when the GPU model has strong aggregate bias. Disable it only for comparison runs:
+
+```bash
+python ml/cloud_gpu_train.py ... --disable-eval-calibration
+```
+
+Interpretation guide:
+
+| Metric | Good enough for DSS demo? |
+|---|---|
+| WMAPE around 1.0 | Weak for order quantity, still usable to demonstrate architecture and risk ranking |
+| Bias above +10% or below -10% | Calibrate before importing predictions |
+| Bias near 0 after calibration | Better for aggregate lost-sales and order-proxy reporting |
 
 For a smoke run:
 
@@ -97,7 +123,7 @@ drive.mount('/content/drive')
 ```bash
 git clone https://github.com/KenKout/ubiquitous-train.git
 cd ubiquitous-train
-python -m pip install -U xgboost scikit-learn pyarrow pandas
+python -m pip install -U numpy pandas pyarrow scikit-learn xgboost
 python ml/cloud_gpu_train.py \
   --features /content/drive/MyDrive/freshretail_features_100k.parquet \
   --output-dir /content/drive/MyDrive/freshretail_cloud_outputs \
