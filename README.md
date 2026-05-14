@@ -195,6 +195,22 @@ uv run python ml/export_model_features.py \
   --output exports/freshretail_features_100k.parquet
 ```
 
+When PostgreSQL and GPU training are on the same Colab runtime, you can skip this export and train directly from the warehouse:
+
+```bash
+uv run python ml/cloud_gpu_train.py \
+  --warehouse-start-date 2024-06-01 \
+  --warehouse-end-date 2024-07-02 \
+  --warehouse-no-order \
+  --output-dir cloud_outputs \
+  --device cuda \
+  --model-name colab_xgboost_gpu \
+  --model-version v3_direct \
+  --n-estimators 800
+```
+
+For faster parquet exports, use `--no-order`, `--sample-rate`, or date filters.
+
 On Kaggle/Colab, train with:
 
 ```bash

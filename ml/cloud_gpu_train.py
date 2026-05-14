@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import psycopg
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
 
@@ -89,10 +91,57 @@ PREDICTION_COLUMNS = [
     "prediction_upper_bound",
 ]
 
+WAREHOUSE_COLUMNS = [
+    "date_key",
+    "full_date",
+    "time_key",
+    "hour_of_day",
+    "is_business_hour_6_22",
+    "store_key",
+    "store_id",
+    "city_id",
+    "product_key",
+    "product_id",
+    "management_group_id",
+    "first_category_id",
+    "second_category_id",
+    "third_category_id",
+    "source_split",
+    "observed_sales_amount",
+    "stockout_flag",
+    "is_censored_observation",
+    "is_trainable_demand_observation",
+    "target_observed_sales_amount",
+    "discount_rate",
+    "activity_flag",
+    "precpt",
+    "avg_temperature",
+    "avg_humidity",
+    "avg_wind_level",
+    "day_of_week",
+    "is_weekend",
+    "holiday_flag",
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a FreshRetail DSS demand model on Kaggle or Colab and export predictions.")
-    parser.add_argument("--features", required=True, help="Parquet exported by ml/export_model_features.py.")
+    parser.add_argument("--features", default=None, help="Parquet exported by ml/export_model_features.py. If omitted, reads directly from PostgreSQL.")
+    parser.add_argument("--host", default=os.getenv("PGHOST", "localhost"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5433")))
+    parser.add_argument("--dbname", default=os.getenv("PGDATABASE", "fresh_retail_dw"))
+    parser.add_argument("--user", default=os.getenv("PGUSER", "warehouse"))
+    parser.add_argument("--password", default=os.getenv("PGPASSWORD", "warehouse"))
+    parser.add_argument("--warehouse-source-split", choices=["train", "eval"], default=None)
+    parser.add_argument("--warehouse-start-date", default=None, help="Inclusive YYYY-MM-DD filter when reading directly from PostgreSQL.")
+    parser.add_argument("--warehouse-end-date", default=None, help="Inclusive YYYY-MM-DD filter when reading directly from PostgreSQL.")
+    parser.add_argument("--warehouse-first-category-id", type=int, default=None)
+    parser.add_argument("--warehouse-store-id", type=int, default=None)
+    parser.add_argument("--warehouse-product-id", type=int, default=None)
+    parser.add_argument("--warehouse-sample-rate", type=float, default=None, help="Approximate random sample fraction when reading directly from PostgreSQL.")
+    parser.add_argument("--warehouse-limit-rows", type=int, default=None)
+    parser.add_argument("--warehouse-no-order", action="store_true", help="Skip ORDER BY for faster direct PostgreSQL reads.")
+    parser.add_argument("--warehouse-chunk-size", type=int, default=250_000)
     parser.add_argument("--output-dir", default="cloud_outputs")
     parser.add_argument("--model-type", choices=["xgboost", "catboost"], default="xgboost")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -112,6 +161,92 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-eval-calibration", action="store_true", help="Do not scale predictions to remove aggregate eval-set bias.")
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
+
+
+def connect(args: argparse.Namespace) -> psycopg.Connection:
+    return psycopg.connect(
+        host=args.host,
+        port=args.port,
+        dbname=args.dbname,
+        user=args.user,
+        password=args.password,
+    )
+
+
+def build_warehouse_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if args.warehouse_source_split:
+        clauses.append("source_split = %s")
+        params.append(args.warehouse_source_split)
+    if args.warehouse_start_date:
+        clauses.append("full_date >= %s")
+        params.append(args.warehouse_start_date)
+    if args.warehouse_end_date:
+        clauses.append("full_date <= %s")
+        params.append(args.warehouse_end_date)
+    if args.warehouse_first_category_id is not None:
+        clauses.append("first_category_id = %s")
+        params.append(args.warehouse_first_category_id)
+    if args.warehouse_store_id is not None:
+        clauses.append("store_id = %s")
+        params.append(args.warehouse_store_id)
+    if args.warehouse_product_id is not None:
+        clauses.append("product_id = %s")
+        params.append(args.warehouse_product_id)
+    if args.warehouse_sample_rate is not None:
+        if args.warehouse_sample_rate <= 0 or args.warehouse_sample_rate > 1:
+            raise ValueError("--warehouse-sample-rate must be in the range (0, 1].")
+        clauses.append("random() < %s")
+        params.append(args.warehouse_sample_rate)
+
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    order_sql = "" if args.warehouse_no_order else "ORDER BY date_key, source_split, store_key, product_key, time_key"
+    limit_sql = ""
+    if args.warehouse_limit_rows is not None:
+        limit_sql = "LIMIT %s"
+        params.append(args.warehouse_limit_rows)
+
+    return (
+        f"""
+        SELECT {", ".join(WAREHOUSE_COLUMNS)}
+        FROM dw.v_model_training_features_hourly
+        {where_sql}
+        {order_sql}
+        {limit_sql}
+        """,
+        tuple(params),
+    )
+
+
+def load_features_from_warehouse(args: argparse.Namespace) -> pd.DataFrame:
+    sql, params = build_warehouse_query(args)
+    chunks: list[pd.DataFrame] = []
+    total_rows = 0
+    with connect(args) as conn:
+        with conn.cursor(name="cloud_training_features") as cur:
+            cur.itersize = args.warehouse_chunk_size
+            cur.execute(sql, params)
+            while True:
+                rows = cur.fetchmany(args.warehouse_chunk_size)
+                if not rows:
+                    break
+                columns = [desc.name for desc in cur.description]
+                chunk = pd.DataFrame(rows, columns=columns)
+                chunks.append(chunk)
+                total_rows += len(chunk)
+                print(f"loaded {total_rows:,} feature rows from warehouse")
+    if not chunks:
+        raise RuntimeError("No warehouse feature rows found. Check hourly facts and filters.")
+    return pd.concat(chunks, ignore_index=True)
+
+
+def load_features(args: argparse.Namespace) -> pd.DataFrame:
+    if args.features:
+        print(f"loading features from {args.features}")
+        return pd.read_parquet(args.features)
+    print("loading features directly from PostgreSQL warehouse")
+    return load_features_from_warehouse(args)
 
 
 def feature_matrix(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
@@ -358,8 +493,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"loading features from {args.features}")
-    features = pd.read_parquet(args.features)
+    features = load_features(args)
     if args.max_predict_rows is not None:
         features = features.sort_values(["date_key", "source_split", "store_key", "product_key", "time_key"]).head(args.max_predict_rows).reset_index(drop=True)
 
@@ -426,7 +560,7 @@ def main() -> None:
         "calibration_factor": calibration_factor,
         "calibration_definition": "prediction scale factor = sum(eval observed demand) / sum(eval predicted demand) on non-stockout eval rows",
         "trained_at": datetime.now(timezone.utc).isoformat(),
-        "features_file": str(args.features),
+        "features_file": str(args.features) if args.features else "postgresql:dw.v_model_training_features_hourly",
         "predictions_file": str(prediction_path),
     }
 

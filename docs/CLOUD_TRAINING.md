@@ -29,9 +29,30 @@ For `1000000` rows per split on Colab, keep `--hourly-workers 4` and avoid incre
 
 ## 3. Local: Export Model Features
 
+If PostgreSQL and GPU training are running on different machines, export parquet:
+
 ```bash
 uv run python ml/export_model_features.py \
   --output exports/freshretail_features_100k.parquet
+```
+
+For faster large exports, skip global sorting and use a representative date window or sample:
+
+```bash
+uv run python ml/export_model_features.py \
+  --output exports/freshretail_features_june.parquet \
+  --start-date 2024-06-01 \
+  --end-date 2024-07-02 \
+  --no-order \
+  --chunk-size 250000
+```
+
+```bash
+uv run python ml/export_model_features.py \
+  --output exports/freshretail_features_sample.parquet \
+  --sample-rate 0.25 \
+  --no-order \
+  --chunk-size 250000
 ```
 
 Optional smoke export:
@@ -43,6 +64,34 @@ uv run python ml/export_model_features.py \
 ```
 
 Upload the exported parquet to a Kaggle Dataset or Google Drive.
+
+If PostgreSQL and GPU training are both on Colab, you can skip the feature parquet entirely and train directly from the warehouse view. Use this when DB I/O is local and you do not need to persist a reusable feature dataset.
+
+```bash
+uv run python ml/cloud_gpu_train.py \
+  --warehouse-start-date 2024-06-01 \
+  --warehouse-end-date 2024-07-02 \
+  --warehouse-no-order \
+  --output-dir cloud_outputs \
+  --device cuda \
+  --model-name colab_xgboost_gpu \
+  --model-version v3_direct \
+  --n-estimators 800 \
+  --max-depth 8 \
+  --learning-rate 0.05
+```
+
+Direct warehouse mode still loads the selected rows into memory before training. If Colab RAM is tight, add:
+
+```bash
+--warehouse-sample-rate 0.25
+```
+
+or:
+
+```bash
+--warehouse-limit-rows 5000000
+```
 
 ## 4. Kaggle: Train On GPU
 

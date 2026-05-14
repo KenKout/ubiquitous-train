@@ -64,7 +64,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--store-id", type=int, default=None)
     parser.add_argument("--product-id", type=int, default=None)
     parser.add_argument("--trainable-only", action="store_true", help="Export only non-stockout rows. Do not use when you need full prediction output.")
+    parser.add_argument("--sample-rate", type=float, default=None, help="Randomly export an approximate fraction of rows, e.g. 0.25. Uses PostgreSQL random().")
     parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument("--no-order", action="store_true", help="Skip ORDER BY for faster large exports. Recommended with date filters or sample-rate.")
     parser.add_argument("--chunk-size", type=int, default=100_000)
     parser.add_argument("--compression", default="zstd", choices=["zstd", "snappy", "gzip", "brotli", "none"])
     return parser.parse_args()
@@ -104,6 +106,11 @@ def build_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...]]:
         params.append(args.product_id)
     if args.trainable_only:
         clauses.append("is_trainable_demand_observation")
+    if args.sample_rate is not None:
+        if args.sample_rate <= 0 or args.sample_rate > 1:
+            raise ValueError("--sample-rate must be in the range (0, 1].")
+        clauses.append("random() < %s")
+        params.append(args.sample_rate)
 
     where_sql = ""
     if clauses:
@@ -114,12 +121,16 @@ def build_query(args: argparse.Namespace) -> tuple[str, tuple[Any, ...]]:
         limit_sql = "LIMIT %s"
         params.append(args.limit_rows)
 
+    order_sql = ""
+    if not args.no_order:
+        order_sql = "ORDER BY date_key, source_split, store_key, product_key, time_key"
+
     column_sql = ", ".join(FEATURE_COLUMNS)
     sql = f"""
         SELECT {column_sql}
         FROM dw.v_model_training_features_hourly
         {where_sql}
-        ORDER BY date_key, source_split, store_key, product_key, time_key
+        {order_sql}
         {limit_sql}
     """
     return sql, tuple(params)
