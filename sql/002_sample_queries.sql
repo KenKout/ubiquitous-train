@@ -4,6 +4,20 @@ FROM dw.v_stockout_rate_by_category
 ORDER BY stockout_rate_6_22 DESC
 LIMIT 20;
 
+-- Warehouse data quality checks for the loaded staging data.
+SELECT *
+FROM dw.v_data_quality_checks
+ORDER BY severity, check_name;
+
+-- Rows available to the model. Train only where is_trainable_demand_observation is true.
+SELECT
+    source_split,
+    is_trainable_demand_observation,
+    COUNT(*) AS hourly_rows
+FROM dw.v_model_training_features_hourly
+GROUP BY source_split, is_trainable_demand_observation
+ORDER BY source_split, is_trainable_demand_observation DESC;
+
 -- Operational restock watchlist for a specific day.
 SELECT *
 FROM dw.v_daily_restock_monitor
@@ -42,14 +56,37 @@ SELECT
     full_date,
     store_id,
     product_id,
+    estimate_source,
     stockout_hours_6_22,
     ROUND(estimated_lost_sales::NUMERIC, 4) AS estimated_lost_sales,
+    ROUND(recommended_order_qty::NUMERIC, 4) AS recommended_order_qty,
     ROUND(restock_urgency_score::NUMERIC, 4) AS restock_urgency_score,
     decision_action,
     decision_reason
 FROM dw.v_dss_daily_decision_score
 ORDER BY restock_urgency_score DESC, estimated_lost_sales DESC
 LIMIT 25;
+
+-- Hourly drill-down for one store-product-date recommendation.
+SELECT
+    d.full_date,
+    t.hour_of_day,
+    s.store_id,
+    p.product_id,
+    h.observed_sales_amount,
+    h.estimated_true_demand,
+    h.estimated_lost_sales,
+    h.stockout_flag,
+    h.estimate_source
+FROM dw.v_dss_hourly_demand_estimate h
+JOIN dw.dim_date d ON d.date_key = h.date_key
+JOIN dw.dim_time t ON t.time_key = h.time_key
+JOIN dw.dim_store s ON s.store_key = h.store_key
+JOIN dw.dim_product p ON p.product_key = h.product_key
+WHERE d.full_date = DATE '2024-06-26'
+  AND s.store_id = 1
+  AND p.product_id = 1
+ORDER BY t.hour_of_day;
 
 -- Category-level DSS pressure summary.
 SELECT

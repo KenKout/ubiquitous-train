@@ -36,10 +36,23 @@ STAGING_COLUMNS = [
     "avg_wind_level",
 ]
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_data_dir() -> str:
+    candidates = [
+        PROJECT_ROOT / "FreshRetailNet-50K" / "data",
+        PROJECT_ROOT.parent / "FreshRetailNet-50K" / "data",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(PROJECT_ROOT.parent / "FreshRetailNet-50K" / "data")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load FreshRetailNet-50K into the PostgreSQL warehouse.")
-    parser.add_argument("--data-dir", default="FreshRetailNet-50K/data", help="Directory containing train.parquet and eval.parquet.")
+    parser.add_argument("--data-dir", default=default_data_dir(), help="Directory containing train.parquet and eval.parquet.")
     parser.add_argument("--schema-file", default="sql/001_schema.sql", help="Warehouse DDL file to apply before loading.")
     parser.add_argument("--host", default=os.getenv("PGHOST", "localhost"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5433")))

@@ -443,27 +443,24 @@ sequenceDiagram
 | Silver dimensions and facts | Implemented |
 | Hourly fact expansion | Implemented |
 | Gold DSS views | Implemented |
-| XGBoost/CatBoost model training | Implemented, experimental quality |
+| XGBoost/CatBoost model training | Implemented from warehouse feature view, experimental quality |
 | Model prediction storage | Implemented |
 | Daily replenishment recommendation storage | Implemented |
 | Streamlit DSS dashboard | Implemented |
 
-Current fast demo data loaded:
+Current practical load options:
 
-| Table | Rows |
-|---|---:|
-| `staging.fresh_retail_observation_day` | 2,000 |
-| `dw.fact_sales_inventory_daily` | 2,000 |
-| `dw.fact_sales_inventory_hourly` | 48,000 |
-| `dw.fact_demand_estimate_hourly` | 48,000 |
-| `dw.fact_replenishment_recommendation_daily` | 2,000 |
+| Mode | Rows Loaded Per Split | Total Daily Rows | Total Hourly Rows |
+|---|---:|---:|---:|
+| Fast demo | 1,000 | 2,000 | 48,000 |
+| Larger practical sample | 10,000 | 20,000 | 480,000 |
 
-The earlier practical demo load used `10,000` daily rows per split and produced `480,000` hourly rows. The current fast configuration uses `1,000` daily rows per split so it can be rebuilt quickly during development.
+The fast demo is the default for quick rebuilds during development. The larger sample is still practical on a laptop and better for model comparison.
 
 Model-quality note:
 
 ```text
-The DSS architecture is complete, but the quick model is not production-grade. The first quick XGBoost model had WAPE around 100.6%, which is weak for ordering decisions. RetailForecast-style CatBoost replication improved local sample WAPE to about 67-68%, while the original RetailForecast notebook reports about 52% WMAPE for CatBoost.
+The DSS architecture is complete, but model quality should be reported as experimental. The current warehouse-native model trains only on non-stockout observations and evaluates on non-stockout rows, because true demand during stockout is unobserved.
 ```
 
 See `docs/EVALUATION.md` for the detailed model comparison and limitations.
@@ -492,10 +489,10 @@ Train model and store predictions:
 
 ```bash
 python3 ml/train_xgboost_demand_model.py \
-  --model-type catboost \
-  --model-name catboost_latent_demand_fast \
+  --model-type xgboost \
+  --model-name xgboost_demand_fast \
   --model-version fast_sample \
-  --n-estimators 80 \
+  --n-estimators 120 \
   --max-train-rows 24000 \
   --max-eval-rows 24000 \
   --load-predictions
@@ -533,6 +530,10 @@ docker compose exec postgres psql -U warehouse -d fresh_retail_dw
 - The architecture supports operational, managerial, and strategic decisions.
 - For this macOS environment, Apple GPU acceleration is not used for the current tree models because XGBoost and CatBoost GPU paths expect NVIDIA CUDA. CPU-optimized CatBoost/XGBoost is the practical choice.
 - The recommended report position is to present model training as integrated but experimental, not production-ready.
+
+## 14. Implementation Log
+
+See [docs/IMPLEMENTATION_LOG.md](docs/IMPLEMENTATION_LOG.md) for the concrete implementation record of what has been built and how the current workflow runs.
 
 ## 13. Possible Future Enhancements
 

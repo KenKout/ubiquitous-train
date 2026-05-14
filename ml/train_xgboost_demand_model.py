@@ -24,7 +24,17 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 FEATURE_COLUMNS = [
-    "time_key",
+    "hour_of_day",
+    "is_business_hour_6_22",
+    "day_of_week",
+    "is_weekend",
+    "holiday_flag",
+    "activity_flag",
+    "discount_rate",
+    "precpt",
+    "avg_temperature",
+    "avg_humidity",
+    "avg_wind_level",
     "city_id",
     "store_id",
     "product_id",
@@ -32,20 +42,11 @@ FEATURE_COLUMNS = [
     "first_category_id",
     "second_category_id",
     "third_category_id",
-    "discount_rate",
-    "activity_flag",
-    "holiday_flag",
-    "precpt",
-    "avg_temperature",
-    "avg_humidity",
-    "avg_wind_level",
-    "day_of_week",
-    "is_weekend",
 ]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an XGBoost latent-demand model from warehouse hourly facts.")
+    parser = argparse.ArgumentParser(description="Train a warehouse-native hourly demand model from non-stockout observations.")
     parser.add_argument("--host", default=os.getenv("PGHOST", "localhost"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5433")))
     parser.add_argument("--dbname", default=os.getenv("PGDATABASE", "fresh_retail_dw"))
@@ -63,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-estimators", type=int, default=250)
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=0.06)
+    parser.add_argument("--n-jobs", type=int, default=max((os.cpu_count() or 2) - 1, 1), help="CPU threads for Apple Silicon/native CPU training.")
+    parser.add_argument("--max-bin", type=int, default=256, help="Histogram bin count for XGBoost CPU hist training.")
     parser.add_argument("--load-predictions", action="store_true", help="Write predictions to warehouse fact tables.")
     return parser.parse_args()
 
@@ -87,37 +90,8 @@ def read_sql(conn: psycopg.Connection, sql: str, params: tuple[Any, ...] = ()) -
 
 def hourly_feature_sql(limit_clause: str = "") -> str:
     return f"""
-        SELECT
-            h.date_key,
-            d.full_date,
-            h.time_key,
-            h.store_key,
-            h.product_key,
-            h.source_split,
-            h.observed_sales_amount,
-            h.stockout_flag,
-            h.is_censored_observation,
-            h.discount_rate,
-            h.activity_flag,
-            h.precpt,
-            h.avg_temperature,
-            h.avg_humidity,
-            h.avg_wind_level,
-            d.day_of_week,
-            d.is_weekend,
-            d.holiday_flag,
-            s.store_id,
-            c.city_id,
-            p.product_id,
-            p.management_group_id,
-            p.first_category_id,
-            p.second_category_id,
-            p.third_category_id
-        FROM dw.fact_sales_inventory_hourly h
-        JOIN dw.dim_date d ON d.date_key = h.date_key
-        JOIN dw.dim_store s ON s.store_key = h.store_key
-        JOIN dw.dim_city c ON c.city_key = s.city_key
-        JOIN dw.dim_product p ON p.product_key = h.product_key
+        SELECT *
+        FROM dw.v_model_training_features_hourly h
         {limit_clause}
     """
 
@@ -130,16 +104,16 @@ def load_training_data(
     limit_clause = ""
     params: tuple[Any, ...] = ()
     if train_sample_rate is not None and max_train_rows:
-        limit_clause = "WHERE h.source_split = 'train' AND random() < %s LIMIT %s"
+        limit_clause = "WHERE h.source_split = 'train' AND h.is_trainable_demand_observation AND random() < %s LIMIT %s"
         params = (train_sample_rate, max_train_rows)
     elif train_sample_rate is not None:
-        limit_clause = "WHERE h.source_split = 'train' AND random() < %s"
+        limit_clause = "WHERE h.source_split = 'train' AND h.is_trainable_demand_observation AND random() < %s"
         params = (train_sample_rate,)
     elif max_train_rows:
-        limit_clause = "WHERE h.source_split = 'train' ORDER BY h.date_key, h.store_key, h.product_key, h.time_key LIMIT %s"
+        limit_clause = "WHERE h.source_split = 'train' AND h.is_trainable_demand_observation ORDER BY h.date_key, h.store_key, h.product_key, h.time_key LIMIT %s"
         params = (max_train_rows,)
     else:
-        limit_clause = "WHERE h.source_split = 'train'"
+        limit_clause = "WHERE h.source_split = 'train' AND h.is_trainable_demand_observation"
 
     df = read_sql(conn, hourly_feature_sql(limit_clause), params)
     if df.empty:
@@ -147,45 +121,16 @@ def load_training_data(
     return df
 
 
-def add_latent_target(df: pd.DataFrame) -> pd.DataFrame:
+def add_observed_demand_target(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
-    non_stockout = data.loc[~data["stockout_flag"].astype(bool)]
-
-    store_product_hour = (
-        non_stockout.groupby(["store_key", "product_key", "time_key"])["observed_sales_amount"]
-        .mean()
-        .rename("store_product_hour_baseline")
-    )
-    product_hour = (
-        non_stockout.groupby(["product_key", "time_key"])["observed_sales_amount"]
-        .mean()
-        .rename("product_hour_baseline")
-    )
-    product_avg = non_stockout.groupby("product_key")["observed_sales_amount"].mean().rename("product_baseline")
-    global_avg = float(non_stockout["observed_sales_amount"].mean()) if not non_stockout.empty else 0.0
-
-    data = data.join(store_product_hour, on=["store_key", "product_key", "time_key"])
-    data = data.join(product_hour, on=["product_key", "time_key"])
-    data = data.join(product_avg, on="product_key")
-    baseline = (
-        data["store_product_hour_baseline"]
-        .fillna(data["product_hour_baseline"])
-        .fillna(data["product_baseline"])
-        .fillna(global_avg)
-    )
-
-    data["latent_demand_target"] = data["observed_sales_amount"].astype(float)
-    stockout_mask = data["stockout_flag"].astype(bool)
-    data.loc[stockout_mask, "latent_demand_target"] = np.maximum(
-        data.loc[stockout_mask, "observed_sales_amount"].astype(float),
-        baseline.loc[stockout_mask].astype(float),
-    )
-    data["latent_demand_target"] = data["latent_demand_target"].clip(lower=0)
+    target = data.get("target_observed_sales_amount", data["observed_sales_amount"])
+    data["demand_target"] = pd.to_numeric(target, errors="coerce").fillna(data["observed_sales_amount"]).astype(float).clip(lower=0)
     return data
 
 
 def feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     x = df[FEATURE_COLUMNS].copy()
+    x["is_business_hour_6_22"] = x["is_business_hour_6_22"].astype(int)
     x["is_weekend"] = x["is_weekend"].astype(int)
     for column in FEATURE_COLUMNS:
         x[column] = pd.to_numeric(x[column], errors="coerce").fillna(0)
@@ -194,7 +139,7 @@ def feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
 def train_model(args: argparse.Namespace, train_df: pd.DataFrame):
     x_train = feature_matrix(train_df)
-    y_train = train_df["latent_demand_target"].astype(float)
+    y_train = train_df["demand_target"].astype(float)
 
     if args.model_type == "xgboost":
         model = XGBRegressor(
@@ -203,10 +148,12 @@ def train_model(args: argparse.Namespace, train_df: pd.DataFrame):
             learning_rate=args.learning_rate,
             objective="reg:squarederror",
             tree_method="hist",
+            device="cpu",
+            max_bin=args.max_bin,
             subsample=0.9,
             colsample_bytree=0.9,
             random_state=42,
-            n_jobs=4,
+            n_jobs=args.n_jobs,
         )
     elif args.model_type == "catboost":
         if CatBoostRegressor is None:
@@ -217,6 +164,7 @@ def train_model(args: argparse.Namespace, train_df: pd.DataFrame):
             learning_rate=args.learning_rate,
             loss_function="Tweedie:variance_power=1.5",
             random_seed=42,
+            thread_count=args.n_jobs,
             verbose=False,
         )
     else:
@@ -226,21 +174,21 @@ def train_model(args: argparse.Namespace, train_df: pd.DataFrame):
     return model
 
 
-def evaluate_model(conn: psycopg.Connection, model: XGBRegressor, train_df: pd.DataFrame, args: argparse.Namespace) -> dict[str, float]:
+def evaluate_model(conn: psycopg.Connection, model: Any, train_df: pd.DataFrame, args: argparse.Namespace) -> dict[str, float]:
     if args.eval_sample_rate is not None and args.max_eval_rows:
-        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' AND random() < %s LIMIT %s"), (args.eval_sample_rate, args.max_eval_rows))
+        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' AND h.is_trainable_demand_observation AND random() < %s LIMIT %s"), (args.eval_sample_rate, args.max_eval_rows))
     elif args.eval_sample_rate is not None:
-        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' AND random() < %s"), (args.eval_sample_rate,))
+        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' AND h.is_trainable_demand_observation AND random() < %s"), (args.eval_sample_rate,))
     elif args.max_eval_rows:
-        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' ORDER BY h.date_key, h.store_key, h.product_key, h.time_key LIMIT %s"), (args.max_eval_rows,))
+        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' AND h.is_trainable_demand_observation ORDER BY h.date_key, h.store_key, h.product_key, h.time_key LIMIT %s"), (args.max_eval_rows,))
     else:
-        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval'"))
+        eval_df = read_sql(conn, hourly_feature_sql("WHERE h.source_split = 'eval' AND h.is_trainable_demand_observation"))
     if eval_df.empty:
         eval_df = train_df.sample(min(len(train_df), 50_000), random_state=42).copy()
 
-    eval_df = add_latent_target(eval_df)
+    eval_df = add_observed_demand_target(eval_df)
     x_eval = feature_matrix(eval_df)
-    y_eval = eval_df["latent_demand_target"].astype(float).to_numpy()
+    y_eval = eval_df["demand_target"].astype(float).to_numpy()
     y_pred = np.clip(model.predict(x_eval), 0, None)
     denominator = np.sum(np.abs(y_eval))
 
@@ -248,14 +196,14 @@ def evaluate_model(conn: psycopg.Connection, model: XGBRegressor, train_df: pd.D
         "rows": float(len(eval_df)),
         "mae": float(mean_absolute_error(y_eval, y_pred)),
         "rmse": float(np.sqrt(mean_squared_error(y_eval, y_pred))),
-        "wape": float(np.sum(np.abs(y_eval - y_pred)) / denominator) if denominator > 0 else 0.0,
+        "wmape": float(np.sum(np.abs(y_eval - y_pred)) / denominator) if denominator > 0 else 0.0,
         "bias": float(np.sum(y_pred - y_eval) / denominator) if denominator > 0 else 0.0,
     }
 
 
 def save_artifacts(
     args: argparse.Namespace,
-    model: XGBRegressor,
+    model: Any,
     metrics: dict[str, float],
     model_version: str,
 ) -> tuple[Path, Path]:
@@ -271,6 +219,7 @@ def save_artifacts(
         "model_type": args.model_type,
         "model_version": model_version,
         "trained_at": datetime.now(timezone.utc).isoformat(),
+        "target_definition": "observed hourly sales on non-stockout rows only",
     }
     with model_path.open("wb") as file:
         pickle.dump(artifact, file)
@@ -391,7 +340,7 @@ def insert_prediction_chunk(conn: psycopg.Connection, prediction_df: pd.DataFram
     conn.commit()
 
 
-def load_predictions(conn: psycopg.Connection, model: XGBRegressor, model_key: int, max_predict_rows: int | None) -> None:
+def load_predictions(conn: psycopg.Connection, model: Any, model_key: int, max_predict_rows: int | None) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT date_key FROM dw.fact_sales_inventory_hourly ORDER BY date_key")
         date_keys = [row[0] for row in cur.fetchall()]
@@ -420,7 +369,10 @@ def load_predictions(conn: psycopg.Connection, model: XGBRegressor, model_key: i
         predictions = np.clip(model.predict(feature_matrix(df)), 0, None)
         observed = df["observed_sales_amount"].astype(float).to_numpy()
         stockout = df["stockout_flag"].astype(bool).to_numpy()
-        estimated_lost_sales = np.where(stockout, np.maximum(predictions - observed, 0), 0)
+        estimated_true_demand = np.where(stockout, np.maximum(predictions, observed), observed)
+        estimated_lost_sales = np.where(stockout, np.maximum(estimated_true_demand - observed, 0), 0)
+        prediction_lower_bound = np.where(stockout, np.maximum(estimated_true_demand * 0.85, observed), observed)
+        prediction_upper_bound = np.where(stockout, np.maximum(estimated_true_demand * 1.15, observed), observed)
 
         prediction_df = pd.DataFrame(
             {
@@ -430,12 +382,12 @@ def load_predictions(conn: psycopg.Connection, model: XGBRegressor, model_key: i
                 "product_key": df["product_key"].astype(int),
                 "model_key": model_key,
                 "observed_sales_amount": observed,
-                "estimated_true_demand": predictions,
+                "estimated_true_demand": estimated_true_demand,
                 "estimated_lost_sales": estimated_lost_sales,
                 "stockout_flag": stockout,
                 "is_censored_observation": stockout,
-                "prediction_lower_bound": np.maximum(predictions * 0.85, 0),
-                "prediction_upper_bound": predictions * 1.15,
+                "prediction_lower_bound": prediction_lower_bound,
+                "prediction_upper_bound": prediction_upper_bound,
             }
         )
 
@@ -491,13 +443,14 @@ def load_recommendations_for_date(conn: psycopg.Connection, model_key: int, date
                 m.store_key,
                 m.product_key,
                 m.model_key,
-                GREATEST(m.expected_demand + m.expected_lost_sales, 0) AS recommended_order_qty,
+                GREATEST(m.expected_demand, 0) AS recommended_order_qty,
                 m.expected_demand,
                 m.expected_lost_sales,
                 LEAST(
                     1,
-                    (m.stockout_hours_total / 24.0) * 0.70
-                    + CASE WHEN m.expected_demand > 0 THEN (m.expected_lost_sales / m.expected_demand) * 0.30 ELSE 0 END
+                    (f.stockout_hours_6_22 / 16.0) * 0.55
+                    + CASE WHEN m.expected_demand > 0 THEN (m.expected_lost_sales / m.expected_demand) * 0.35 ELSE 0 END
+                    + CASE WHEN f.activity_flag <> 0 THEN 0.10 ELSE 0 END
                 ) AS stockout_risk_score,
                 GREATEST(f.observed_daily_sales_amount - m.expected_demand, 0) AS expected_waste_qty,
                 0.95 AS service_level_target
@@ -539,10 +492,10 @@ def main() -> None:
     with connect(args) as conn:
         print("loading hourly training data")
         train_df = load_training_data(conn, args.max_train_rows, args.train_sample_rate)
-        train_df = add_latent_target(train_df)
+        train_df = add_observed_demand_target(train_df)
         print(f"training rows: {len(train_df):,}")
 
-        print(f"training {args.model_type} latent-demand model")
+        print(f"training {args.model_type} demand model from non-stockout observations")
         model = train_model(args, train_df)
 
         print("evaluating model")

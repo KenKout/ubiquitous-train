@@ -401,20 +401,16 @@ Full hourly warehouse:
 python3 etl/load_fresh_retail_dw.py --reset --load-hourly
 ```
 
-### Current Demo Load Counts
+### Current Demo Load Options
 
-The current validated demo load contains:
+The repository supports two practical warehouse load sizes:
 
-| Table | Rows |
-|---|---:|
-| `staging.fresh_retail_observation_day` | 20,000 |
-| `dw.dim_date` | 97 |
-| `dw.dim_time` | 24 |
-| `dw.dim_city` | 1 |
-| `dw.dim_store` | 17 |
-| `dw.dim_product` | 283 |
-| `dw.fact_sales_inventory_daily` | 20,000 |
-| `dw.fact_sales_inventory_hourly` | 480,000 |
+| Mode | Command Shape | Total Daily Rows | Total Hourly Rows |
+|---|---|---:|---:|
+| Fast demo | `--limit-rows-per-split 1000 --load-hourly` | 2,000 | 48,000 |
+| Larger practical sample | `--limit-rows-per-split 10000 --load-hourly` | 20,000 | 480,000 |
+
+The fast demo is intended for quick rebuilds during development. The larger sample is still manageable on a laptop and gives the model a broader training base.
 
 ## 9. DSS Views Before Model Training
 
@@ -478,17 +474,17 @@ Training script:
 ml/train_xgboost_demand_model.py
 ```
 
-The model layer supports XGBoost and CatBoost latent-demand estimators trained from the hourly warehouse fact. CatBoost performed best in local RetailForecast-style replication.
+The model layer supports XGBoost and CatBoost demand estimators trained from `dw.v_model_training_features_hourly`. The default project path is XGBoost with CPU histogram training, which runs natively on Apple Silicon and does not require CUDA or MPS.
 
 ### Training Flow
 
 ```mermaid
 flowchart TD
     A[Start Training Script] --> B[Connect to PostgreSQL]
-    B --> C[Read dw.fact_sales_inventory_hourly]
-    C --> D[Join dim_date, dim_store, dim_city, dim_product]
+    B --> C[Read dw.v_model_training_features_hourly]
+    C --> D[Filter non-stockout rows for training]
     D --> E[Create feature matrix]
-    E --> F[Recover latent-demand target]
+    E --> F[Target = observed hourly sales]
     F --> G[Train XGBoost or CatBoost Regressor]
     G --> H[Evaluate on eval split]
     H --> I[Save model artifact to models/]
@@ -508,7 +504,17 @@ The model uses warehouse-derived features:
 
 | Feature | Source |
 |---|---|
-| `time_key` | `dw.fact_sales_inventory_hourly` |
+| `hour_of_day` | `dw.dim_time` |
+| `is_business_hour_6_22` | `dw.dim_time` |
+| `day_of_week` | `dw.dim_date` |
+| `is_weekend` | `dw.dim_date` |
+| `holiday_flag` | `dw.dim_date` |
+| `activity_flag` | `dw.fact_sales_inventory_hourly` |
+| `discount_rate` | `dw.fact_sales_inventory_hourly` |
+| `precpt` | `dw.fact_sales_inventory_hourly` |
+| `avg_temperature` | `dw.fact_sales_inventory_hourly` |
+| `avg_humidity` | `dw.fact_sales_inventory_hourly` |
+| `avg_wind_level` | `dw.fact_sales_inventory_hourly` |
 | `city_id` | `dw.dim_city` |
 | `store_id` | `dw.dim_store` |
 | `product_id` | `dw.dim_product` |
@@ -516,34 +522,25 @@ The model uses warehouse-derived features:
 | `first_category_id` | `dw.dim_product` |
 | `second_category_id` | `dw.dim_product` |
 | `third_category_id` | `dw.dim_product` |
-| `discount_rate` | `dw.fact_sales_inventory_hourly` |
-| `activity_flag` | `dw.fact_sales_inventory_hourly` |
-| `holiday_flag` | `dw.dim_date` |
-| `precpt` | `dw.fact_sales_inventory_hourly` |
-| `avg_temperature` | `dw.fact_sales_inventory_hourly` |
-| `avg_humidity` | `dw.fact_sales_inventory_hourly` |
-| `avg_wind_level` | `dw.fact_sales_inventory_hourly` |
-| `day_of_week` | `dw.dim_date` |
-| `is_weekend` | `dw.dim_date` |
 
-### Latent-Demand Target Construction
+### Target Construction
 
-Observed sales are censored during stockouts. The training target is adjusted as follows:
+Observed sales are censored during stockouts, so the model is trained only where observed sales are most reliable:
 
 ```mermaid
 flowchart TD
-    A[Hourly observed sales] --> B{Stockout?}
-    B -->|No| C[Target = observed sales]
-    B -->|Yes| D[Estimate baseline demand from non-stockout rows]
-    D --> E[Same store/product/hour baseline]
-    E --> F[Product/hour fallback]
-    F --> G[Product fallback]
-    G --> H[Target = max observed sales, baseline)]
-    C --> I[Train target: latent_demand_target]
-    H --> I
+    A[Hourly warehouse rows] --> B{Stockout?}
+    B -->|No| C[Use row for training]
+    B -->|Yes| D[Exclude row from training target]
+    C --> E[Target = observed hourly sales]
+    E --> F[Train demand model]
+    F --> G[Predict all rows]
+    G --> H{Prediction row stocked out?}
+    H -->|No| I[Estimated demand = observed sales]
+    H -->|Yes| J[Estimated demand = max observed sales, prediction]
 ```
 
-This target is not perfect true demand, but it reduces censored-demand bias and gives the model a more useful signal than raw observed sales.
+The SQL heuristic baseline remains the explainable fallback when no model predictions exist. The heuristic fallback order is store-product-hour, product-hour, category-hour, product average, then global hour average.
 
 ### Training Command
 
@@ -565,30 +562,30 @@ Current quick warehouse model metadata:
 
 | Field | Value |
 |---|---|
-| `model_name` | `catboost_latent_demand_fast` |
-| `model_version` | `fast_sample` |
+| `model_name` | `xgboost_demand_fast` |
+| `model_version` | `smoke_m1` |
 | Training start | 2024-03-28 |
 | Training end | 2024-06-25 |
 
 Important evaluation caveat:
 
 ```text
-The first quick XGBoost model had WAPE around 100.6%, which is weak for inventory ordering. RetailForecast-style CatBoost replication improved local sample WAPE to about 67-68%, but this is still experimental. The original RetailForecast notebook reports about 52% WMAPE for CatBoost when using its heavier preparation pipeline.
+Model metrics are evaluated only on non-stockout rows because true demand during stockout is unobserved. The model is suitable for demonstrating warehouse-to-DSS integration, not production-grade ordering optimization.
 ```
 
-Current fast warehouse CatBoost metrics:
+Current M1 smoke XGBoost metrics:
 
 | Metric | Value |
 |---|---:|
-| Evaluation rows | 24,000 |
-| MAE | 0.0598 |
-| RMSE | 0.1103 |
-| WAPE | 1.1070 |
-| Bias | -26.95% |
+| Evaluation rows | 5,000 |
+| MAE | 0.0603 |
+| RMSE | 0.0974 |
+| WMAPE | 1.2536 |
+| Bias | -17.78% |
 
 Best local RetailForecast-style replication result:
 
-| Model | Target | Eval rows | WAPE | Bias |
+| Model | Target | Eval rows | WMAPE | Bias |
 |---|---|---:|---:|---:|
 | CatBoost | latent baseline | 240,000 | 67.69% | +29.65% |
 
@@ -597,8 +594,8 @@ See `docs/EVALUATION.md` for the full model comparison.
 Artifacts:
 
 ```text
-models/xgboost_latent_demand_20260507152251.pkl
-models/xgboost_latent_demand_20260507152251_metrics.json
+models/xgboost_demand_fast_smoke_m1.pkl
+models/xgboost_demand_fast_smoke_m1_metrics.json
 ```
 
 ## 13. Model Output Storage
@@ -856,10 +853,12 @@ Train model and store DSS predictions:
 
 ```bash
 python3 ml/train_xgboost_demand_model.py \
-  --model-type catboost \
-  --model-name catboost_latent_demand_fast \
+  --model-type xgboost \
+  --model-name xgboost_demand_fast \
   --model-version fast_sample \
-  --n-estimators 80 \
+  --n-estimators 120 \
+  --max-depth 6 \
+  --learning-rate 0.08 \
   --max-train-rows 24000 \
   --max-eval-rows 24000 \
   --load-predictions

@@ -54,8 +54,21 @@ def load_model_status() -> pd.DataFrame:
             model_version,
             training_start_date,
             training_end_date,
-            created_at
-        FROM dw.v_latest_model
+            created_at,
+            demand_estimate_rows,
+            recommendation_rows
+        FROM dw.v_latest_model_with_predictions
+        """
+    )
+
+
+@st.cache_data(ttl=60)
+def load_quality_checks() -> pd.DataFrame:
+    return run_query(
+        """
+        SELECT check_name, failed_rows, severity, details
+        FROM dw.v_data_quality_checks
+        ORDER BY severity, check_name
         """
     )
 
@@ -108,6 +121,7 @@ def load_summary(where_sql: str, params: tuple[Any, ...]) -> pd.DataFrame:
             AVG(waste_risk_score) AS avg_waste_risk_score,
             AVG(demand_bias_rate) AS avg_demand_bias_rate,
             AVG(restock_urgency_score) AS avg_restock_urgency_score,
+            SUM(recommended_order_qty) AS recommended_order_qty,
             COUNT(*) FILTER (WHERE decision_action = 'Restock immediately') AS immediate_restock_count,
             COUNT(*) FILTER (WHERE decision_action = 'Increase next order') AS increase_order_count,
             COUNT(*) FILTER (WHERE decision_action = 'Reduce order or markdown') AS reduce_order_count,
@@ -174,22 +188,102 @@ def load_recommendations(where_sql: str, params: tuple[Any, ...]) -> pd.DataFram
             first_category_id,
             model_name,
             model_version,
+            estimate_source,
             observed_daily_sales_amount,
             estimated_true_demand,
             estimated_lost_sales,
+            recommended_order_qty,
             stockout_hours_6_22,
             stockout_rate_6_22,
             demand_bias_rate,
             waste_risk_score,
             restock_urgency_score,
+            service_level_target,
+            expected_waste_qty,
             decision_action,
-            decision_reason
+            decision_reason,
+            inventory_proxy_note
         FROM dw.v_dss_daily_decision_score
         WHERE {where_sql}
         ORDER BY restock_urgency_score DESC, estimated_lost_sales DESC, stockout_hours_6_22 DESC
         LIMIT 200
         """,
         params,
+    )
+
+
+@st.cache_data(ttl=60)
+def load_hourly_drilldown(full_date: date, store_id: int, product_id: int) -> pd.DataFrame:
+    return run_query(
+        """
+        SELECT
+            t.hour_of_day,
+            h.observed_sales_amount,
+            h.estimated_true_demand,
+            h.estimated_lost_sales,
+            CASE WHEN h.stockout_flag THEN 1 ELSE 0 END AS stockout_flag,
+            h.estimate_source,
+            h.estimate_explanation
+        FROM dw.v_dss_hourly_demand_estimate h
+        JOIN dw.dim_date d ON d.date_key = h.date_key
+        JOIN dw.dim_time t ON t.time_key = h.time_key
+        JOIN dw.dim_store s ON s.store_key = h.store_key
+        JOIN dw.dim_product p ON p.product_key = h.product_key
+        WHERE d.full_date = %s
+          AND s.store_id = %s
+          AND p.product_id = %s
+        ORDER BY t.hour_of_day
+        """,
+        (full_date, store_id, product_id),
+    )
+
+
+@st.cache_data(ttl=60)
+def load_what_if(
+    where_sql: str,
+    params: tuple[Any, ...],
+    urgency_threshold: float,
+    service_level_target: float,
+) -> pd.DataFrame:
+    return run_query(
+        f"""
+        SELECT
+            COUNT(*) AS product_store_days,
+            COUNT(*) FILTER (WHERE restock_urgency_score >= %s) AS restock_count,
+            COUNT(*) FILTER (
+                WHERE restock_urgency_score < %s
+                  AND stockout_rate_6_22 >= 0.20
+            ) AS increase_order_count,
+            COUNT(*) FILTER (
+                WHERE restock_urgency_score < %s
+                  AND stockout_rate_6_22 < 0.20
+                  AND waste_risk_score >= 0.70
+            ) AS markdown_count,
+            COUNT(*) FILTER (
+                WHERE restock_urgency_score < %s
+                  AND stockout_rate_6_22 < 0.20
+                  AND waste_risk_score < 0.70
+                  AND demand_bias_rate >= 0.20
+            ) AS review_bias_count,
+            SUM(
+                CASE
+                    WHEN restock_urgency_score >= %s
+                    THEN recommended_order_qty * (%s / NULLIF(service_level_target, 0))
+                    ELSE 0
+                END
+            ) AS restock_order_qty_proxy
+        FROM dw.v_dss_daily_decision_score
+        WHERE {where_sql}
+        """,
+        (
+            urgency_threshold,
+            urgency_threshold,
+            urgency_threshold,
+            urgency_threshold,
+            urgency_threshold,
+            service_level_target,
+            *params,
+        ),
     )
 
 
@@ -231,9 +325,18 @@ def main() -> None:
         model = model_status.iloc[0]
         st.success(
             f"Using trained model `{model['model_name']}` version `{model['model_version']}` "
-            f"with {int(status['demand_estimate_rows']):,} hourly predictions and "
-            f"{int(status['recommendation_rows']):,} daily recommendations."
+            f"with {int(model['demand_estimate_rows']):,} hourly predictions and "
+            f"{int(model['recommendation_rows']):,} daily recommendations."
         )
+
+    quality_checks = load_quality_checks()
+    failed_checks = quality_checks.loc[pd.to_numeric(quality_checks["failed_rows"], errors="coerce") > 0]
+    if failed_checks.empty:
+        st.caption("Warehouse quality checks passed for loaded staging data.")
+    else:
+        st.warning(f"{len(failed_checks)} warehouse quality check(s) have failures. Review them before using decisions for reporting.")
+    with st.expander("Warehouse data quality checks"):
+        st.dataframe(quality_checks, use_container_width=True, hide_index=True)
 
     categories, stores, products = load_filter_options()
 
@@ -276,6 +379,17 @@ def main() -> None:
     col6.metric("Estimated Demand", metric_value(summary["estimated_true_demand"]))
     col7.metric("Estimated Lost Sales", metric_value(summary["estimated_lost_sales"]))
     col8.metric("Avg Urgency", metric_value(summary["avg_restock_urgency_score"] * 100, "%"))
+
+    st.subheader("What-if Decision Policy")
+    what_if_col1, what_if_col2 = st.columns(2)
+    urgency_threshold = what_if_col1.slider("Immediate restock urgency threshold", min_value=0.30, max_value=0.90, value=0.65, step=0.05)
+    service_level_target = what_if_col2.slider("Service level target for order proxy", min_value=0.80, max_value=0.99, value=0.95, step=0.01)
+    what_if = load_what_if(where_sql, params, urgency_threshold, service_level_target).iloc[0]
+    what1, what2, what3, what4 = st.columns(4)
+    what1.metric("Restock Items", metric_value(what_if["restock_count"]))
+    what2.metric("Increase Order Items", metric_value(what_if["increase_order_count"]))
+    what3.metric("Markdown Items", metric_value(what_if["markdown_count"]))
+    what4.metric("Restock Qty Proxy", metric_value(what_if["restock_order_qty_proxy"]))
 
     trend = load_trend(where_sql, params)
     category_summary = load_category_summary(where_sql, params)
@@ -323,6 +437,43 @@ def main() -> None:
         },
     )
 
+    st.subheader("Hourly Drill-down")
+    if recommendations.empty:
+        st.info("No recommendations available for hourly drill-down.")
+    else:
+        recommendation_options = recommendations.reset_index(drop=True)
+        selected_index = st.selectbox(
+            "Select a recommendation",
+            recommendation_options.index.tolist(),
+            format_func=lambda idx: (
+                f"{recommendation_options.loc[idx, 'full_date']} | "
+                f"store {int(recommendation_options.loc[idx, 'store_id'])} | "
+                f"product {int(recommendation_options.loc[idx, 'product_id'])} | "
+                f"{recommendation_options.loc[idx, 'decision_action']}"
+            ),
+        )
+        selected_row = recommendation_options.loc[selected_index]
+        hourly = load_hourly_drilldown(
+            selected_row["full_date"],
+            int(selected_row["store_id"]),
+            int(selected_row["product_id"]),
+        )
+        if hourly.empty:
+            st.info("Hourly fact rows are not loaded for this recommendation. Re-run ETL with `--load-hourly` to enable drill-down.")
+        else:
+            hourly_numeric = coerce_numeric_columns(
+                hourly,
+                ["observed_sales_amount", "estimated_true_demand", "estimated_lost_sales", "stockout_flag"],
+            )
+            hourly_numeric["hour_of_day"] = hourly_numeric["hour_of_day"].astype(int)
+            st.line_chart(
+                hourly_numeric,
+                x="hour_of_day",
+                y=["observed_sales_amount", "estimated_true_demand", "estimated_lost_sales"],
+            )
+            st.bar_chart(hourly_numeric, x="hour_of_day", y="stockout_flag")
+            st.dataframe(hourly, use_container_width=True, hide_index=True)
+
     with st.expander("How the DSS scores are calculated"):
         st.markdown(
             """
@@ -330,6 +481,8 @@ def main() -> None:
             - Waste minimization: proxy score for low observed sales when no stockout occurred.
             - Faster restocking: urgency score combining stockout rate, estimated lost sales bias, and promotion/activity signal.
             - Censored-demand bias: estimated lost sales during stockout hours using non-stockout hourly baselines.
+            - What-if: threshold changes recompute decision counts without modifying the warehouse.
+            - Order and waste quantities are proxies because the source data has no stock-on-hand, expiry, lead time, or supplier constraints.
             - A row can show 100% stockout, 100% demand bias, and 100% urgency when the product was stocked out for all 16 business hours, observed sales were zero, and the trained model still estimated positive demand.
             """
         )

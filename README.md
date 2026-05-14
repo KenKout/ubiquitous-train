@@ -24,13 +24,26 @@ password: warehouse
 uv pip install -r requirements.txt
 ```
 
+## Current Process
+
+The current repository workflow is:
+
+1. Start PostgreSQL with Docker Compose.
+2. Install the Python dependencies.
+3. Hydrate the real `FreshRetailNet-50K/data/train.parquet` and `FreshRetailNet-50K/data/eval.parquet` files.
+4. Load the warehouse with a fast demo sample or a larger practical sample.
+5. Train a demand model and optionally write predictions and recommendations back to PostgreSQL.
+6. Run the Streamlit DSS dashboard against the latest model data when available.
+
+For a precise record of what is currently implemented, see [docs/IMPLEMENTATION_LOG.md](docs/IMPLEMENTATION_LOG.md).
+
 ## Prepare Dataset
 
-The dataset files are intentionally not committed because they are large. Place the real parquet files at:
+The dataset files are intentionally not committed because they are large. The loader auto-detects the sibling dataset path used for this project:
 
 ```text
-FreshRetailNet-50K/data/train.parquet
-FreshRetailNet-50K/data/eval.parquet
+../FreshRetailNet-50K/data/train.parquet
+../FreshRetailNet-50K/data/eval.parquet
 ```
 
 One option is to clone the Hugging Face dataset and hydrate/download the parquet files:
@@ -101,19 +114,28 @@ streamlit run app/dss_dashboard.py
 
 The basic DSS can fall back to heuristic demand recovery, but real decisions should use a trained model. The training script uses the loaded hourly warehouse facts, learns a tree-based latent-demand model, stores the model artifact, and writes predictions back to the warehouse.
 
-For the fast demo warehouse, train CatBoost and load predictions:
+When `--load-predictions` is not used, the dashboard still works by reading the heuristic fallback views in PostgreSQL. When predictions are loaded, it automatically uses the latest trained model registered in `dw.dim_model`.
+
+For the fast demo warehouse, train the M1-friendly XGBoost CPU histogram model and load predictions:
 
 ```bash
 python3 ml/train_xgboost_demand_model.py \
-  --model-type catboost \
-  --model-name catboost_latent_demand_fast \
+  --model-type xgboost \
+  --model-name xgboost_demand_fast \
   --model-version fast_sample \
-  --n-estimators 80 \
+  --n-estimators 120 \
   --max-depth 6 \
   --learning-rate 0.08 \
   --max-train-rows 24000 \
   --max-eval-rows 24000 \
   --load-predictions
+```
+
+Apple Silicon note:
+
+```text
+XGBoost with tree_method=hist and device=cpu runs natively on macOS arm64 wheels and is the safest fast option on M1/M2 machines.
+The script also supports CatBoost when installed, but the core workflow does not require CUDA, MPS, Chronos, SAITS, LSTM, or GRU.
 ```
 
 To compare against the cloned `RetailForecast/` approach, run the replication script:
@@ -138,7 +160,8 @@ The dashboard automatically uses the latest trained model from `dw.dim_model` wh
 Evaluation note:
 
 ```text
-The current quick model is for DSS demonstration, not production ordering. The first quick XGBoost model had WAPE around 100.6%, which is weak. RetailForecast-style CatBoost improved local sample WAPE to about 67-68%, while the original RetailForecast notebook reports about 52% WMAPE for CatBoost.
+Model MAE/RMSE/WMAPE are evaluated on non-stockout rows, where observed sales are usable demand labels.
+True demand during stockout is unobserved, so stockout-row evaluation remains a DSS approximation rather than ground truth.
 ```
 
 See detailed documentation:
@@ -178,9 +201,19 @@ Useful views:
 
 - `dw.v_daily_restock_monitor`
 - `dw.v_stockout_rate_by_category`
+- `dw.v_data_quality_checks`
+- `dw.v_model_training_features_hourly`
+- `dw.v_latest_model_with_predictions`
 - `dw.v_dss_hourly_demand_estimate`
 - `dw.v_dss_daily_decision_score`
 - `dw.v_dss_kpi_by_day`
 - `dw.v_dss_kpi_by_category`
+
+Implementation notes:
+
+- Bronze data is stored in `staging.fresh_retail_observation_day`.
+- Daily and hourly warehouse facts are built in `dw.fact_sales_inventory_daily` and `dw.fact_sales_inventory_hourly`.
+- Model outputs are stored in `dw.fact_demand_estimate_hourly` and `dw.fact_replenishment_recommendation_daily`.
+- The dashboard queries `dw.v_dss_daily_decision_score`, which combines the latest model output if present, otherwise uses the SQL heuristic fallback.
 
 Sample decision-support queries are in `sql/002_sample_queries.sql`.

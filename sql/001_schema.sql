@@ -222,7 +222,10 @@ DROP VIEW IF EXISTS dw.v_dss_kpi_by_category;
 DROP VIEW IF EXISTS dw.v_dss_kpi_by_day;
 DROP VIEW IF EXISTS dw.v_dss_daily_decision_score;
 DROP VIEW IF EXISTS dw.v_dss_hourly_demand_estimate;
+DROP VIEW IF EXISTS dw.v_model_training_features_hourly;
+DROP VIEW IF EXISTS dw.v_latest_model_with_predictions;
 DROP VIEW IF EXISTS dw.v_latest_model;
+DROP VIEW IF EXISTS dw.v_data_quality_checks;
 
 CREATE OR REPLACE VIEW dw.v_latest_model AS
 SELECT model_key, model_name, model_version, training_start_date, training_end_date, created_at
@@ -230,20 +233,141 @@ FROM dw.dim_model
 ORDER BY created_at DESC, model_key DESC
 LIMIT 1;
 
+CREATE OR REPLACE VIEW dw.v_latest_model_with_predictions AS
+SELECT
+    m.model_key,
+    m.model_name,
+    m.model_version,
+    m.training_start_date,
+    m.training_end_date,
+    m.created_at,
+    (
+        SELECT COUNT(*)
+        FROM dw.fact_demand_estimate_hourly e
+        WHERE e.model_key = m.model_key
+    ) AS demand_estimate_rows,
+    (
+        SELECT COUNT(*)
+        FROM dw.fact_replenishment_recommendation_daily r
+        WHERE r.model_key = m.model_key
+    ) AS recommendation_rows
+FROM dw.dim_model m
+WHERE EXISTS (
+    SELECT 1
+    FROM dw.fact_demand_estimate_hourly e
+    WHERE e.model_key = m.model_key
+)
+ORDER BY m.created_at DESC, m.model_key DESC
+LIMIT 1;
+
+CREATE OR REPLACE VIEW dw.v_data_quality_checks AS
+SELECT
+    'hours_sale_length_24'::TEXT AS check_name,
+    COUNT(*) FILTER (WHERE ARRAY_LENGTH(hours_sale, 1) IS DISTINCT FROM 24)::BIGINT AS failed_rows,
+    'critical'::TEXT AS severity,
+    'Every source row must contain 24 hourly sales values.'::TEXT AS details
+FROM staging.fresh_retail_observation_day
+UNION ALL
+SELECT
+    'hours_stock_status_length_24'::TEXT AS check_name,
+    COUNT(*) FILTER (WHERE ARRAY_LENGTH(hours_stock_status, 1) IS DISTINCT FROM 24)::BIGINT AS failed_rows,
+    'critical'::TEXT AS severity,
+    'Every source row must contain 24 hourly stockout flags.'::TEXT AS details
+FROM staging.fresh_retail_observation_day
+UNION ALL
+SELECT
+    'daily_sales_equals_hourly_sum'::TEXT AS check_name,
+    COUNT(*) FILTER (WHERE ABS(sale_amount - COALESCE(hour_sum, 0)) > 0.000001)::BIGINT AS failed_rows,
+    'warning'::TEXT AS severity,
+    'Daily sales should equal the sum of hours_sale within floating-point tolerance.'::TEXT AS details
+FROM staging.fresh_retail_observation_day s
+CROSS JOIN LATERAL (
+    SELECT SUM(value) AS hour_sum
+    FROM UNNEST(s.hours_sale) AS value
+) h
+UNION ALL
+SELECT
+    'business_hour_stockout_count_matches'::TEXT AS check_name,
+    COUNT(*) FILTER (WHERE stock_hour6_22_cnt <> COALESCE(business_stockout_hours, 0))::BIGINT AS failed_rows,
+    'critical'::TEXT AS severity,
+    'stock_hour6_22_cnt should equal stockout flags from hours 6 through 21.'::TEXT AS details
+FROM staging.fresh_retail_observation_day s
+CROSS JOIN LATERAL (
+    SELECT SUM(value)::INTEGER AS business_stockout_hours
+    FROM UNNEST(s.hours_stock_status) WITH ORDINALITY AS u(value, ordinal)
+    WHERE ordinal BETWEEN 7 AND 22
+) h
+UNION ALL
+SELECT
+    'duplicate_staging_grain'::TEXT AS check_name,
+    COALESCE(SUM(duplicate_count - 1), 0)::BIGINT AS failed_rows,
+    'critical'::TEXT AS severity,
+    'The staging grain must be source_split, store_id, product_id, dt.'::TEXT AS details
+FROM (
+    SELECT COUNT(*) AS duplicate_count
+    FROM staging.fresh_retail_observation_day
+    GROUP BY source_split, store_id, product_id, dt
+    HAVING COUNT(*) > 1
+) duplicates;
+
+CREATE OR REPLACE VIEW dw.v_model_training_features_hourly AS
+SELECT
+    h.date_key,
+    d.full_date,
+    h.time_key,
+    t.hour_of_day,
+    t.is_business_hour_6_22,
+    h.store_key,
+    s.store_id,
+    c.city_id,
+    h.product_key,
+    p.product_id,
+    p.management_group_id,
+    p.first_category_id,
+    p.second_category_id,
+    p.third_category_id,
+    h.source_split,
+    h.observed_sales_amount,
+    h.stockout_flag,
+    h.is_censored_observation,
+    NOT h.stockout_flag AS is_trainable_demand_observation,
+    CASE WHEN NOT h.stockout_flag THEN h.observed_sales_amount END AS target_observed_sales_amount,
+    h.discount_rate,
+    h.activity_flag,
+    h.precpt,
+    h.avg_temperature,
+    h.avg_humidity,
+    h.avg_wind_level,
+    d.day_of_week,
+    d.is_weekend,
+    d.holiday_flag
+FROM dw.fact_sales_inventory_hourly h
+JOIN dw.dim_date d ON d.date_key = h.date_key
+JOIN dw.dim_time t ON t.time_key = h.time_key
+JOIN dw.dim_store s ON s.store_key = h.store_key
+JOIN dw.dim_city c ON c.city_key = s.city_key
+JOIN dw.dim_product p ON p.product_key = h.product_key;
+
 CREATE OR REPLACE VIEW dw.v_dss_hourly_demand_estimate AS
 WITH latest_model AS (
     SELECT model_key, model_name, model_version
-    FROM dw.v_latest_model
+    FROM dw.v_latest_model_with_predictions
 ), hourly_baseline AS (
     SELECT
         h.*,
+        p.first_category_id,
         AVG(h.observed_sales_amount) FILTER (WHERE NOT h.stockout_flag)
             OVER (PARTITION BY h.store_key, h.product_key, h.time_key) AS store_product_hour_avg,
         AVG(h.observed_sales_amount) FILTER (WHERE NOT h.stockout_flag)
             OVER (PARTITION BY h.product_key, h.time_key) AS product_hour_avg,
         AVG(h.observed_sales_amount) FILTER (WHERE NOT h.stockout_flag)
-            OVER (PARTITION BY h.product_key) AS product_avg
+            OVER (PARTITION BY p.first_category_id, h.time_key) AS category_hour_avg,
+        AVG(h.observed_sales_amount) FILTER (WHERE NOT h.stockout_flag)
+            OVER (PARTITION BY h.product_key) AS product_avg,
+        AVG(h.observed_sales_amount) FILTER (WHERE NOT h.stockout_flag)
+            OVER (PARTITION BY h.time_key) AS global_hour_avg
     FROM dw.fact_sales_inventory_hourly h
+    JOIN dw.dim_product p ON p.product_key = h.product_key
 ), heuristic_estimate AS (
     SELECT
         date_key,
@@ -262,14 +386,14 @@ WITH latest_model AS (
         avg_wind_level,
         CASE
             WHEN stockout_flag THEN GREATEST(
-                COALESCE(store_product_hour_avg, product_hour_avg, product_avg, observed_sales_amount),
+                COALESCE(store_product_hour_avg, product_hour_avg, category_hour_avg, product_avg, global_hour_avg, observed_sales_amount),
                 observed_sales_amount
             )
             ELSE observed_sales_amount
         END AS heuristic_true_demand,
         CASE
             WHEN stockout_flag THEN GREATEST(
-                COALESCE(store_product_hour_avg, product_hour_avg, product_avg, observed_sales_amount) - observed_sales_amount,
+                COALESCE(store_product_hour_avg, product_hour_avg, category_hour_avg, product_avg, global_hour_avg, observed_sales_amount) - observed_sales_amount,
                 0
             )
             ELSE 0
@@ -293,11 +417,16 @@ SELECT
     h.avg_wind_level,
     COALESCE(m.estimated_true_demand, h.heuristic_true_demand) AS estimated_true_demand,
     COALESCE(m.estimated_lost_sales, h.heuristic_lost_sales) AS estimated_lost_sales,
+    lm.model_key,
     lm.model_name,
     lm.model_version,
     CASE
+        WHEN m.model_key IS NOT NULL THEN 'model'
+        ELSE 'heuristic'
+    END AS estimate_source,
+    CASE
         WHEN m.model_key IS NOT NULL THEN 'Trained model estimate from latest model in dw.dim_model.'
-        WHEN h.stockout_flag THEN 'Fallback heuristic: stockout hour demand estimated from non-stockout sales for the same store/product/hour, then product/hour fallback.'
+        WHEN h.stockout_flag THEN 'Fallback heuristic: stockout hour demand estimated from non-stockout sales using store-product-hour, product-hour, category-hour, product, then global-hour fallback.'
         ELSE 'Fallback heuristic: non-stockout hour uses observed sales as demand.'
     END AS estimate_explanation
 FROM heuristic_estimate h
@@ -310,13 +439,21 @@ LEFT JOIN dw.fact_demand_estimate_hourly m
     AND m.product_key = h.product_key;
 
 CREATE OR REPLACE VIEW dw.v_dss_daily_decision_score AS
-WITH hourly_daily AS (
+WITH latest_model AS (
+    SELECT model_key, model_name, model_version
+    FROM dw.v_latest_model_with_predictions
+), hourly_daily AS (
     SELECT
         date_key,
         store_key,
         product_key,
+        MAX(model_key) AS model_key,
         MAX(model_name) AS model_name,
         MAX(model_version) AS model_version,
+        CASE
+            WHEN BOOL_OR(estimate_source = 'model') THEN 'model'
+            ELSE 'heuristic'
+        END AS estimate_source,
         SUM(estimated_true_demand) AS estimated_true_demand,
         SUM(estimated_lost_sales) AS estimated_lost_sales,
         SUM(CASE WHEN stockout_flag THEN 1 ELSE 0 END) AS stockout_hours_total_from_hourly
@@ -338,6 +475,7 @@ WITH hourly_daily AS (
         f.source_split,
         h.model_name,
         h.model_version,
+        COALESCE(h.estimate_source, 'daily_fact_only') AS estimate_source,
         f.observed_daily_sales_amount,
         COALESCE(h.estimated_true_demand, f.observed_daily_sales_amount) AS estimated_true_demand,
         COALESCE(h.estimated_lost_sales, 0) AS estimated_lost_sales,
@@ -351,16 +489,27 @@ WITH hourly_daily AS (
         f.avg_temperature,
         f.avg_humidity,
         f.avg_wind_level,
-        AVG(f.observed_daily_sales_amount) OVER (PARTITION BY f.product_key) AS product_avg_daily_sales
+        AVG(f.observed_daily_sales_amount) OVER (PARTITION BY f.product_key) AS product_avg_daily_sales,
+        r.recommended_order_qty AS model_recommended_order_qty,
+        r.expected_demand AS model_expected_demand,
+        r.expected_lost_sales AS model_expected_lost_sales,
+        r.expected_waste_qty AS model_expected_waste_qty,
+        r.service_level_target AS model_service_level_target
     FROM dw.fact_sales_inventory_daily f
     JOIN dw.dim_date d ON d.date_key = f.date_key
     JOIN dw.dim_store store ON store.store_key = f.store_key
     JOIN dw.dim_city city ON city.city_key = store.city_key
     JOIN dw.dim_product product ON product.product_key = f.product_key
+    LEFT JOIN latest_model lm ON TRUE
     LEFT JOIN hourly_daily h
         ON h.date_key = f.date_key
         AND h.store_key = f.store_key
         AND h.product_key = f.product_key
+    LEFT JOIN dw.fact_replenishment_recommendation_daily r
+        ON r.model_key = lm.model_key
+        AND r.date_key = f.date_key
+        AND r.store_key = f.store_key
+        AND r.product_key = f.product_key
 ), scored AS (
     SELECT
         *,
@@ -392,6 +541,9 @@ WITH hourly_daily AS (
 )
 SELECT
     *,
+    COALESCE(model_recommended_order_qty, GREATEST(estimated_true_demand, 0)) AS recommended_order_qty,
+    COALESCE(model_service_level_target, 0.95) AS service_level_target,
+    COALESCE(model_expected_waste_qty, GREATEST(observed_daily_sales_amount - estimated_true_demand, 0)) AS expected_waste_qty,
     CASE
         WHEN restock_urgency_score >= 0.65 THEN 'Restock immediately'
         WHEN stockout_rate_6_22 >= 0.20 THEN 'Increase next order'
@@ -405,7 +557,8 @@ SELECT
         WHEN waste_risk_score >= 0.70 THEN 'Low sales with no stockout suggests overstock or spoilage risk.'
         WHEN demand_bias_rate >= 0.20 THEN 'Observed sales likely understate true customer demand.'
         ELSE 'No strong intervention signal from current criteria.'
-    END AS decision_reason
+    END AS decision_reason,
+    'recommended_order_qty and waste_risk_score are DSS proxies because source data has no stock_on_hand, expiry date, lead time, or supplier constraint.' AS inventory_proxy_note
 FROM final_score;
 
 CREATE OR REPLACE VIEW dw.v_dss_kpi_by_day AS
@@ -419,6 +572,7 @@ SELECT
     AVG(waste_risk_score) AS avg_waste_risk_score,
     AVG(demand_bias_rate) AS avg_demand_bias_rate,
     AVG(restock_urgency_score) AS avg_restock_urgency_score,
+    SUM(recommended_order_qty) AS recommended_order_qty,
     COUNT(*) FILTER (WHERE decision_action = 'Restock immediately') AS immediate_restock_count,
     COUNT(*) FILTER (WHERE decision_action = 'Reduce order or markdown') AS waste_action_count
 FROM dw.v_dss_daily_decision_score
@@ -438,6 +592,7 @@ SELECT
     AVG(waste_risk_score) AS avg_waste_risk_score,
     AVG(demand_bias_rate) AS avg_demand_bias_rate,
     AVG(restock_urgency_score) AS avg_restock_urgency_score,
+    SUM(recommended_order_qty) AS recommended_order_qty,
     COUNT(*) FILTER (WHERE decision_action = 'Restock immediately') AS immediate_restock_count,
     COUNT(*) FILTER (WHERE decision_action = 'Reduce order or markdown') AS waste_action_count
 FROM dw.v_dss_daily_decision_score
