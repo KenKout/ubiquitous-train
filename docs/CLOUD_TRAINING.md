@@ -58,7 +58,7 @@ If using `uv`, quote version constraints because `>` can be interpreted by the s
 uv pip install --system 'numpy>=1.26' pandas pyarrow scikit-learn xgboost
 ```
 
-Example Kaggle command:
+Example Kaggle command with production-grade feature engineering:
 
 ```bash
 python ml/cloud_gpu_train.py \
@@ -70,7 +70,27 @@ python ml/cloud_gpu_train.py \
   --model-version v1 \
   --n-estimators 800 \
   --max-depth 8 \
-  --learning-rate 0.05
+  --learning-rate 0.05 \
+  --xgboost-objective reg:tweedie \
+  --tweedie-variance-power 1.4
+```
+
+Advanced features are enabled by default. The script builds train-only historical priors and stockout-pressure features before training:
+
+```text
+store-product-hour demand mean
+product-hour demand mean
+category-hour demand mean
+product/day-of-week and category/day-of-week demand mean
+store-product/product/category stockout rate
+cyclic hour/day-of-week features
+discount, promotion, and weather interaction features
+```
+
+Use raw warehouse features only for ablation runs:
+
+```bash
+python ml/cloud_gpu_train.py ... --disable-advanced-features
 ```
 
 By default, `ml/cloud_gpu_train.py` calibrates prediction volume on non-stockout eval rows:
@@ -135,14 +155,26 @@ python ml/cloud_gpu_train.py \
 
 ## 6. Local: Import Predictions Back To PostgreSQL
 
-After downloading the prediction parquet:
+After downloading the prediction parquet, metrics JSON, and metadata JSON:
 
 ```bash
 uv run python ml/import_cloud_predictions.py \
   --predictions exports/kaggle_xgboost_gpu_v1_predictions.parquet \
+  --metrics exports/kaggle_xgboost_gpu_v1_metrics.json \
+  --metadata exports/kaggle_xgboost_gpu_v1_metadata.json \
   --model-name kaggle_xgboost_gpu \
   --model-version v1 \
   --replace-model-output
+```
+
+If the sidecar files use the standard names, `--metrics` and `--metadata` are auto-detected from the prediction filename.
+
+The import step writes:
+
+```text
+dw.fact_demand_estimate_hourly
+dw.fact_replenishment_recommendation_daily
+dw.fact_model_evaluation
 ```
 
 Then run the dashboard:
@@ -152,6 +184,7 @@ uv run streamlit run app/dss_dashboard.py
 ```
 
 The dashboard will use `dw.v_latest_model_with_predictions`, so the imported cloud model becomes the active DSS model automatically.
+The dashboard also reads `dw.v_model_quality_summary` to show the latest model's WMAPE, bias, calibration factor, and metric guardrails.
 
 ## 7. Why This Is Better Than Full PostgreSQL Training
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 from datetime import datetime, timezone
 from io import StringIO
@@ -33,6 +34,8 @@ DEMAND_COLUMNS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import Kaggle/Colab prediction parquet into the DSS warehouse model facts.")
     parser.add_argument("--predictions", required=True, help="Prediction parquet written by ml/cloud_gpu_train.py.")
+    parser.add_argument("--metrics", default=None, help="Optional metrics JSON written by ml/cloud_gpu_train.py. Auto-detected when omitted.")
+    parser.add_argument("--metadata", default=None, help="Optional metadata JSON written by ml/cloud_gpu_train.py. Auto-detected when omitted.")
     parser.add_argument("--host", default=os.getenv("PGHOST", "localhost"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5433")))
     parser.add_argument("--dbname", default=os.getenv("PGDATABASE", "fresh_retail_dw"))
@@ -72,6 +75,71 @@ def upsert_model_metadata(conn: psycopg.Connection, model_name: str, model_versi
         model_key = cur.fetchone()[0]
     conn.commit()
     return int(model_key)
+
+
+def auto_detect_sidecar(prediction_path: Path, suffix: str) -> Path | None:
+    expected_name = prediction_path.name.replace("_predictions.parquet", suffix)
+    candidate = prediction_path.with_name(expected_name)
+    return candidate if candidate.exists() else None
+
+
+def numeric_metric_rows(metrics: dict, prefix: str = "") -> list[tuple[str, float]]:
+    rows: list[tuple[str, float]] = []
+    for key, value in metrics.items():
+        metric_name = f"{prefix}_{key}" if prefix else key
+        if isinstance(value, bool):
+            rows.append((metric_name, float(value)))
+        elif isinstance(value, (int, float)):
+            rows.append((metric_name, float(value)))
+        elif isinstance(value, dict):
+            rows.extend(numeric_metric_rows(value, metric_name))
+    return rows
+
+
+def import_model_metrics(conn: psycopg.Connection, model_key: int, metrics_path: Path | None, metadata_path: Path | None) -> int:
+    if metrics_path is None or not metrics_path.exists():
+        print("no metrics JSON found; skipping model metric import")
+        return 0
+
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metadata = {}
+    if metadata_path is not None and metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    context = {
+        "metrics_file": str(metrics_path),
+        "metadata_file": str(metadata_path) if metadata_path else None,
+        "model_type": metadata.get("model_type"),
+        "device": metadata.get("device"),
+        "xgboost_objective": metadata.get("xgboost_objective"),
+        "tweedie_variance_power": metadata.get("tweedie_variance_power"),
+        "advanced_features_enabled": metadata.get("advanced_features_enabled"),
+        "feature_count": len(metadata.get("feature_columns", [])) if isinstance(metadata.get("feature_columns"), list) else None,
+        "target_definition": metadata.get("target_definition"),
+    }
+
+    rows = numeric_metric_rows(metrics)
+    with conn.cursor() as cur:
+        for metric_name, metric_value in rows:
+            cur.execute(
+                """
+                INSERT INTO dw.fact_model_evaluation (
+                    model_key,
+                    evaluation_split,
+                    metric_name,
+                    metric_value,
+                    metric_context
+                )
+                VALUES (%s, 'eval', %s, %s, %s::JSONB)
+                ON CONFLICT (model_key, evaluation_split, metric_name) DO UPDATE SET
+                    metric_value = EXCLUDED.metric_value,
+                    metric_context = EXCLUDED.metric_context,
+                    created_at = NOW()
+                """,
+                (model_key, metric_name, metric_value, json.dumps(context)),
+            )
+    conn.commit()
+    return len(rows)
 
 
 def replace_existing_output(conn: psycopg.Connection, model_key: int) -> None:
@@ -334,6 +402,9 @@ def main() -> None:
     if not prediction_path.exists():
         raise FileNotFoundError(prediction_path)
 
+    metrics_path = Path(args.metrics) if args.metrics else auto_detect_sidecar(prediction_path, "_metrics.json")
+    metadata_path = Path(args.metadata) if args.metadata else auto_detect_sidecar(prediction_path, "_metadata.json")
+
     model_version = args.model_version or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     with connect(args) as conn:
         model_key = upsert_model_metadata(conn, args.model_name, model_version)
@@ -345,6 +416,7 @@ def main() -> None:
         create_temp_table(conn)
         prediction_rows = import_predictions(conn, prediction_path, model_key, args.chunk_size)
         refresh_model_training_dates(conn, model_key)
+        metric_rows = import_model_metrics(conn, model_key, metrics_path, metadata_path)
 
         recommendation_rows = 0
         if not args.skip_recommendations:
@@ -352,6 +424,7 @@ def main() -> None:
 
         print(f"dw.fact_demand_estimate_hourly rows imported: {prediction_rows:,}")
         print(f"dw.fact_replenishment_recommendation_daily rows loaded: {recommendation_rows:,}")
+        print(f"dw.fact_model_evaluation rows upserted: {metric_rows:,}")
 
 
 if __name__ == "__main__":

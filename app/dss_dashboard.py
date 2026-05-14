@@ -63,6 +63,30 @@ def load_model_status() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
+def load_model_quality() -> pd.DataFrame:
+    return run_query(
+        """
+        SELECT
+            q.model_key,
+            q.model_name,
+            q.model_version,
+            q.eval_rows,
+            q.mae,
+            q.rmse,
+            q.wmape,
+            q.bias,
+            q.calibration_factor,
+            q.prediction_rows,
+            q.uncalibrated_wmape,
+            q.uncalibrated_bias,
+            q.metrics_loaded_at
+        FROM dw.v_model_quality_summary q
+        JOIN dw.v_latest_model_with_predictions lm ON lm.model_key = q.model_key
+        """
+    )
+
+
+@st.cache_data(ttl=60)
 def load_quality_checks() -> pd.DataFrame:
     return run_query(
         """
@@ -301,6 +325,12 @@ def metric_value(value: Any, suffix: str = "") -> str:
     return f"{float(value):,.2f}{suffix}"
 
 
+def metric_value_precise(value: Any, digits: int = 4, suffix: str = "") -> str:
+    if pd.isna(value):
+        return "n/a"
+    return f"{float(value):,.{digits}f}{suffix}"
+
+
 def coerce_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     result = df.copy()
     for column in columns:
@@ -328,6 +358,23 @@ def main() -> None:
             f"with {int(model['demand_estimate_rows']):,} hourly predictions and "
             f"{int(model['recommendation_rows']):,} daily recommendations."
         )
+
+    model_quality = load_model_quality()
+    if not model_quality.empty:
+        quality = model_quality.iloc[0]
+        st.subheader("Model Quality Guardrail")
+        mq1, mq2, mq3, mq4, mq5 = st.columns(5)
+        mq1.metric("Eval Rows", metric_value(quality["eval_rows"]))
+        mq2.metric("WMAPE", metric_value_precise(quality["wmape"], 4))
+        mq3.metric("Bias", metric_value_precise(quality["bias"] * 100, 2, "%"))
+        mq4.metric("Calibration", metric_value_precise(quality["calibration_factor"], 4))
+        mq5.metric("MAE", metric_value_precise(quality["mae"], 4))
+        if pd.notna(quality["wmape"]) and float(quality["wmape"]) >= 0.8:
+            st.warning("Model error is still high. Use recommendations as risk ranking and decision support, not exact order optimization.")
+        if pd.notna(quality["bias"]) and abs(float(quality["bias"])) <= 0.05:
+            st.caption("Aggregate demand bias is within +/-5%, which is acceptable for DSS-level lost-sales and action-priority reporting.")
+        with st.expander("Latest model metrics"):
+            st.dataframe(model_quality, use_container_width=True, hide_index=True)
 
     quality_checks = load_quality_checks()
     failed_checks = quality_checks.loc[pd.to_numeric(quality_checks["failed_rows"], errors="coerce") > 0]

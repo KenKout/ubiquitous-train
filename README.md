@@ -177,8 +177,11 @@ python ml/cloud_gpu_train.py \
   --device cuda \
   --model-name kaggle_xgboost_gpu \
   --model-version v1 \
-  --n-estimators 800
+  --n-estimators 800 \
+  --xgboost-objective reg:tweedie
 ```
+
+Cloud training now enables advanced historical demand priors, stockout-rate features, cyclic time features, eval-set calibration, and segmented model metrics by default.
 
 Then import the downloaded predictions locally:
 
@@ -189,6 +192,8 @@ uv run python ml/import_cloud_predictions.py \
   --model-version v1 \
   --replace-model-output
 ```
+
+If matching metrics/metadata JSON files are next to the prediction parquet, they are imported into `dw.fact_model_evaluation` and shown in the dashboard model-quality panel.
 
 Use `100000` as daily rows per split, not `100000` boosting rounds. Start with `600-1000` trees for GPU training. See `docs/CLOUD_TRAINING.md` for the full workflow.
 
@@ -232,6 +237,7 @@ Facts:
 - `dw.fact_sales_inventory_hourly`
 - `dw.fact_demand_estimate_hourly`
 - `dw.fact_replenishment_recommendation_daily`
+- `dw.fact_model_evaluation`
 
 Useful views:
 
@@ -240,6 +246,7 @@ Useful views:
 - `dw.v_data_quality_checks`
 - `dw.v_model_training_features_hourly`
 - `dw.v_latest_model_with_predictions`
+- `dw.v_model_quality_summary`
 - `dw.v_dss_hourly_demand_estimate`
 - `dw.v_dss_daily_decision_score`
 - `dw.v_dss_kpi_by_day`

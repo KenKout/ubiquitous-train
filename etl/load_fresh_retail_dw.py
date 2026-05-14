@@ -90,6 +90,7 @@ def reset_tables(conn: psycopg.Connection) -> None:
     tables = [
         "dw.fact_replenishment_recommendation_daily",
         "dw.fact_demand_estimate_hourly",
+        "dw.fact_model_evaluation",
         "dw.fact_sales_inventory_hourly",
         "dw.fact_sales_inventory_daily",
         "dw.dim_model",

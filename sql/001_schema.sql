@@ -151,6 +151,16 @@ CREATE TABLE IF NOT EXISTS dw.fact_replenishment_recommendation_daily (
     CONSTRAINT fact_replenishment_recommendation_daily_pk PRIMARY KEY (date_key, store_key, product_key, model_key)
 );
 
+CREATE TABLE IF NOT EXISTS dw.fact_model_evaluation (
+    model_key INTEGER NOT NULL REFERENCES dw.dim_model(model_key),
+    evaluation_split TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    metric_value DOUBLE PRECISION NOT NULL,
+    metric_context JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fact_model_evaluation_pk PRIMARY KEY (model_key, evaluation_split, metric_name)
+);
+
 CREATE INDEX IF NOT EXISTS fresh_retail_observation_day_dt_idx
     ON staging.fresh_retail_observation_day(dt);
 
@@ -168,6 +178,9 @@ CREATE INDEX IF NOT EXISTS fact_sales_inventory_hourly_product_date_idx
 
 CREATE INDEX IF NOT EXISTS fact_sales_inventory_hourly_store_date_idx
     ON dw.fact_sales_inventory_hourly(store_key, date_key, time_key);
+
+CREATE INDEX IF NOT EXISTS fact_model_evaluation_model_idx
+    ON dw.fact_model_evaluation(model_key, evaluation_split);
 
 CREATE OR REPLACE VIEW dw.v_daily_restock_monitor AS
 SELECT
@@ -223,6 +236,7 @@ DROP VIEW IF EXISTS dw.v_dss_kpi_by_day;
 DROP VIEW IF EXISTS dw.v_dss_daily_decision_score;
 DROP VIEW IF EXISTS dw.v_dss_hourly_demand_estimate;
 DROP VIEW IF EXISTS dw.v_model_training_features_hourly;
+DROP VIEW IF EXISTS dw.v_model_quality_summary;
 DROP VIEW IF EXISTS dw.v_latest_model_with_predictions;
 DROP VIEW IF EXISTS dw.v_latest_model;
 DROP VIEW IF EXISTS dw.v_data_quality_checks;
@@ -259,6 +273,26 @@ WHERE EXISTS (
 )
 ORDER BY m.created_at DESC, m.model_key DESC
 LIMIT 1;
+
+CREATE OR REPLACE VIEW dw.v_model_quality_summary AS
+SELECT
+    m.model_key,
+    m.model_name,
+    m.model_version,
+    m.created_at,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'rows') AS eval_rows,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'mae') AS mae,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'rmse') AS rmse,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'wmape') AS wmape,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'bias') AS bias,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'calibration_factor') AS calibration_factor,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'prediction_rows') AS prediction_rows,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'uncalibrated_wmape') AS uncalibrated_wmape,
+    MAX(e.metric_value) FILTER (WHERE e.evaluation_split = 'eval' AND e.metric_name = 'uncalibrated_bias') AS uncalibrated_bias,
+    MAX(e.created_at) AS metrics_loaded_at
+FROM dw.dim_model m
+LEFT JOIN dw.fact_model_evaluation e ON e.model_key = m.model_key
+GROUP BY m.model_key, m.model_name, m.model_version, m.created_at;
 
 CREATE OR REPLACE VIEW dw.v_data_quality_checks AS
 SELECT

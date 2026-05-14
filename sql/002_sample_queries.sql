@@ -18,6 +18,12 @@ FROM dw.v_model_training_features_hourly
 GROUP BY source_split, is_trainable_demand_observation
 ORDER BY source_split, is_trainable_demand_observation DESC;
 
+-- Latest model quality guardrail.
+SELECT *
+FROM dw.v_model_quality_summary
+ORDER BY created_at DESC
+LIMIT 5;
+
 -- Operational restock watchlist for a specific day.
 SELECT *
 FROM dw.v_daily_restock_monitor

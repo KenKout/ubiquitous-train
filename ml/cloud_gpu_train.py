@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover - optional cloud dependency
     CatBoostRegressor = None
 
 
-FEATURE_COLUMNS = [
+BASE_FEATURE_COLUMNS = [
     "hour_of_day",
     "is_business_hour_6_22",
     "day_of_week",
@@ -39,6 +39,39 @@ FEATURE_COLUMNS = [
     "first_category_id",
     "second_category_id",
     "third_category_id",
+]
+
+ADVANCED_FEATURE_COLUMNS = [
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "discount_depth",
+    "is_discounted",
+    "is_promo_or_discount",
+    "temperature_humidity_index",
+    "store_product_hour_mean",
+    "store_product_hour_count_log1p",
+    "product_hour_mean",
+    "product_hour_count_log1p",
+    "category_hour_mean",
+    "category_hour_count_log1p",
+    "product_dow_mean",
+    "product_dow_count_log1p",
+    "category_dow_mean",
+    "category_dow_count_log1p",
+    "store_product_mean",
+    "store_product_count_log1p",
+    "product_mean",
+    "product_count_log1p",
+    "category_mean",
+    "category_count_log1p",
+    "global_hour_mean",
+    "global_dow_mean",
+    "baseline_demand_prior",
+    "store_product_stockout_rate",
+    "product_stockout_rate",
+    "category_stockout_rate",
 ]
 
 PREDICTION_COLUMNS = [
@@ -68,23 +101,117 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-estimators", type=int, default=600, help="Boosting rounds/trees. Do not set this to 100k.")
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=0.05)
+    parser.add_argument("--xgboost-objective", choices=["reg:tweedie", "reg:squarederror", "count:poisson"], default="reg:tweedie")
+    parser.add_argument("--tweedie-variance-power", type=float, default=1.4)
     parser.add_argument("--max-bin", type=int, default=256)
     parser.add_argument("--max-train-rows", type=int, default=None, help="Optional cap after filtering non-stockout train rows.")
     parser.add_argument("--max-eval-rows", type=int, default=None, help="Optional cap after filtering non-stockout eval rows.")
     parser.add_argument("--max-predict-rows", type=int, default=None, help="Optional cap for smoke tests only.")
     parser.add_argument("--prediction-batch-size", type=int, default=500_000)
+    parser.add_argument("--disable-advanced-features", action="store_true", help="Use only raw warehouse features, without historical demand priors.")
     parser.add_argument("--disable-eval-calibration", action="store_true", help="Do not scale predictions to remove aggregate eval-set bias.")
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
 
-def feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    x = df[FEATURE_COLUMNS].copy()
+def feature_matrix(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+    x = df[feature_columns].copy()
     for column in ["is_business_hour_6_22", "is_weekend"]:
-        x[column] = x[column].astype(int)
-    for column in FEATURE_COLUMNS:
+        if column in x.columns:
+            x[column] = x[column].astype(int)
+    for column in feature_columns:
         x[column] = pd.to_numeric(x[column], errors="coerce").fillna(0)
     return x
+
+
+def merge_mean_count(
+    features: pd.DataFrame,
+    reference: pd.DataFrame,
+    keys: list[str],
+    mean_column: str,
+    count_column: str,
+) -> pd.DataFrame:
+    stats = (
+        reference.groupby(keys, dropna=False)["observed_sales_amount"]
+        .agg(["mean", "count"])
+        .rename(columns={"mean": mean_column, "count": count_column})
+        .reset_index()
+    )
+    return features.merge(stats, on=keys, how="left")
+
+
+def merge_rate(
+    features: pd.DataFrame,
+    reference: pd.DataFrame,
+    keys: list[str],
+    rate_column: str,
+) -> pd.DataFrame:
+    stats = reference.groupby(keys, dropna=False)["stockout_flag"].mean().rename(rate_column).reset_index()
+    return features.merge(stats, on=keys, how="left")
+
+
+def add_advanced_features(features: pd.DataFrame) -> pd.DataFrame:
+    result = features.copy()
+    result["hour_sin"] = np.sin(2 * np.pi * result["hour_of_day"].astype(float) / 24.0)
+    result["hour_cos"] = np.cos(2 * np.pi * result["hour_of_day"].astype(float) / 24.0)
+    result["dow_sin"] = np.sin(2 * np.pi * result["day_of_week"].astype(float) / 7.0)
+    result["dow_cos"] = np.cos(2 * np.pi * result["day_of_week"].astype(float) / 7.0)
+    result["discount_depth"] = np.maximum(1.0 - pd.to_numeric(result["discount_rate"], errors="coerce").fillna(1.0), 0)
+    result["is_discounted"] = result["discount_depth"] > 0.001
+    result["is_promo_or_discount"] = result["is_discounted"] | (pd.to_numeric(result["activity_flag"], errors="coerce").fillna(0) != 0)
+    result["temperature_humidity_index"] = (
+        pd.to_numeric(result["avg_temperature"], errors="coerce").fillna(0)
+        * pd.to_numeric(result["avg_humidity"], errors="coerce").fillna(0)
+    ) / 100.0
+
+    non_stockout_train = result[(result["source_split"] == "train") & (result["is_trainable_demand_observation"].astype(bool))]
+    train_all = result[result["source_split"] == "train"]
+    global_mean = float(non_stockout_train["observed_sales_amount"].mean()) if not non_stockout_train.empty else 0.0
+
+    demand_groups = [
+        (["store_id", "product_id", "hour_of_day"], "store_product_hour_mean", "store_product_hour_count"),
+        (["product_id", "hour_of_day"], "product_hour_mean", "product_hour_count"),
+        (["first_category_id", "hour_of_day"], "category_hour_mean", "category_hour_count"),
+        (["product_id", "day_of_week"], "product_dow_mean", "product_dow_count"),
+        (["first_category_id", "day_of_week"], "category_dow_mean", "category_dow_count"),
+        (["store_id", "product_id"], "store_product_mean", "store_product_count"),
+        (["product_id"], "product_mean", "product_count"),
+        (["first_category_id"], "category_mean", "category_count"),
+        (["hour_of_day"], "global_hour_mean", "global_hour_count"),
+        (["day_of_week"], "global_dow_mean", "global_dow_count"),
+    ]
+    for keys, mean_column, count_column in demand_groups:
+        result = merge_mean_count(result, non_stockout_train, keys, mean_column, count_column)
+        result[f"{count_column}_log1p"] = np.log1p(pd.to_numeric(result[count_column], errors="coerce").fillna(0))
+        result = result.drop(columns=[count_column])
+
+    result["baseline_demand_prior"] = (
+        result["store_product_hour_mean"]
+        .fillna(result["product_hour_mean"])
+        .fillna(result["category_hour_mean"])
+        .fillna(result["product_dow_mean"])
+        .fillna(result["category_dow_mean"])
+        .fillna(result["store_product_mean"])
+        .fillna(result["product_mean"])
+        .fillna(result["category_mean"])
+        .fillna(result["global_hour_mean"])
+        .fillna(result["global_dow_mean"])
+        .fillna(global_mean)
+    )
+
+    stockout_groups = [
+        (["store_id", "product_id"], "store_product_stockout_rate"),
+        (["product_id"], "product_stockout_rate"),
+        (["first_category_id"], "category_stockout_rate"),
+    ]
+    for keys, rate_column in stockout_groups:
+        result = merge_rate(result, train_all, keys, rate_column)
+
+    for column in ADVANCED_FEATURE_COLUMNS:
+        if column not in result.columns:
+            result[column] = 0
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+    return result
 
 
 def sample_if_needed(df: pd.DataFrame, max_rows: int | None, random_state: int) -> pd.DataFrame:
@@ -93,24 +220,27 @@ def sample_if_needed(df: pd.DataFrame, max_rows: int | None, random_state: int) 
     return df.reset_index(drop=True)
 
 
-def train_model(args: argparse.Namespace, train_df: pd.DataFrame):
-    x_train = feature_matrix(train_df)
+def train_model(args: argparse.Namespace, train_df: pd.DataFrame, feature_columns: list[str]):
+    x_train = feature_matrix(train_df, feature_columns)
     y_train = pd.to_numeric(train_df["target_observed_sales_amount"], errors="coerce").fillna(train_df["observed_sales_amount"]).astype(float)
 
     if args.model_type == "xgboost":
-        model = XGBRegressor(
-            n_estimators=args.n_estimators,
-            max_depth=args.max_depth,
-            learning_rate=args.learning_rate,
-            objective="reg:squarederror",
-            tree_method="hist",
-            device=args.device,
-            max_bin=args.max_bin,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=args.random_state,
-            n_jobs=-1,
-        )
+        xgboost_params = {
+            "n_estimators": args.n_estimators,
+            "max_depth": args.max_depth,
+            "learning_rate": args.learning_rate,
+            "objective": args.xgboost_objective,
+            "tree_method": "hist",
+            "device": args.device,
+            "max_bin": args.max_bin,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "random_state": args.random_state,
+            "n_jobs": -1,
+        }
+        if args.xgboost_objective == "reg:tweedie":
+            xgboost_params["tweedie_variance_power"] = args.tweedie_variance_power
+        model = XGBRegressor(**xgboost_params)
     elif args.model_type == "catboost":
         if CatBoostRegressor is None:
             raise RuntimeError("catboost is not installed. On Kaggle/Colab, run `pip install catboost` first.")
@@ -148,24 +278,41 @@ def evaluate_predictions(y_eval: np.ndarray, y_pred: np.ndarray) -> dict[str, fl
     }
 
 
-def evaluate_model(model: Any, eval_df: pd.DataFrame, calibration_factor: float = 1.0) -> dict[str, float]:
-    x_eval = feature_matrix(eval_df)
+def evaluate_model(model: Any, eval_df: pd.DataFrame, feature_columns: list[str], calibration_factor: float = 1.0) -> dict[str, float]:
+    x_eval = feature_matrix(eval_df, feature_columns)
     y_eval = demand_target(eval_df).to_numpy()
     y_pred = np.clip(model.predict(x_eval) * calibration_factor, 0, None)
     return evaluate_predictions(y_eval, y_pred)
 
 
-def compute_calibration_factor(model: Any, eval_df: pd.DataFrame) -> float:
+def compute_calibration_factor(model: Any, eval_df: pd.DataFrame, feature_columns: list[str]) -> float:
     y_eval = demand_target(eval_df).to_numpy()
-    y_pred = np.clip(model.predict(feature_matrix(eval_df)), 0, None)
+    y_pred = np.clip(model.predict(feature_matrix(eval_df, feature_columns)), 0, None)
     prediction_sum = float(np.sum(y_pred))
     if prediction_sum <= 0:
         return 1.0
     return float(np.sum(y_eval) / prediction_sum)
 
 
-def prediction_frame(model: Any, df: pd.DataFrame, calibration_factor: float) -> pd.DataFrame:
-    predictions = np.clip(model.predict(feature_matrix(df)) * calibration_factor, 0, None)
+def evaluate_segments(model: Any, eval_df: pd.DataFrame, feature_columns: list[str], calibration_factor: float) -> dict[str, dict[str, float]]:
+    segment_masks = {
+        "business_hour": eval_df["is_business_hour_6_22"].astype(bool),
+        "non_business_hour": ~eval_df["is_business_hour_6_22"].astype(bool),
+        "weekend": eval_df["is_weekend"].astype(bool),
+        "weekday": ~eval_df["is_weekend"].astype(bool),
+        "promo_or_discount": eval_df.get("is_promo_or_discount", pd.Series(False, index=eval_df.index)).astype(bool),
+    }
+    segments: dict[str, dict[str, float]] = {}
+    for name, mask in segment_masks.items():
+        segment = eval_df.loc[mask]
+        if len(segment) == 0:
+            continue
+        segments[name] = evaluate_model(model, segment, feature_columns, calibration_factor)
+    return segments
+
+
+def prediction_frame(model: Any, df: pd.DataFrame, feature_columns: list[str], calibration_factor: float) -> pd.DataFrame:
+    predictions = np.clip(model.predict(feature_matrix(df, feature_columns)) * calibration_factor, 0, None)
     observed = pd.to_numeric(df["observed_sales_amount"], errors="coerce").fillna(0).astype(float).to_numpy()
     stockout = df["stockout_flag"].astype(bool).to_numpy()
     estimated_true_demand = np.where(stockout, np.maximum(predictions, observed), observed)
@@ -184,7 +331,7 @@ def prediction_frame(model: Any, df: pd.DataFrame, calibration_factor: float) ->
     return result[PREDICTION_COLUMNS]
 
 
-def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, batch_size: int, calibration_factor: float) -> int:
+def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, batch_size: int, feature_columns: list[str], calibration_factor: float) -> int:
     if output_path.exists():
         output_path.unlink()
     total_rows = 0
@@ -192,7 +339,7 @@ def write_predictions(model: Any, features: pd.DataFrame, output_path: Path, bat
     try:
         for start in range(0, len(features), batch_size):
             batch = features.iloc[start : start + batch_size]
-            predictions = prediction_frame(model, batch, calibration_factor)
+            predictions = prediction_frame(model, batch, feature_columns, calibration_factor)
             arrow_table = pa.Table.from_pandas(predictions, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(output_path, arrow_table.schema, compression="zstd")
@@ -216,6 +363,14 @@ def main() -> None:
     if args.max_predict_rows is not None:
         features = features.sort_values(["date_key", "source_split", "store_key", "product_key", "time_key"]).head(args.max_predict_rows).reset_index(drop=True)
 
+    feature_columns = BASE_FEATURE_COLUMNS.copy()
+    if args.disable_advanced_features:
+        print("advanced feature engineering disabled")
+    else:
+        print("adding train-only historical demand and stockout features")
+        features = add_advanced_features(features)
+        feature_columns += ADVANCED_FEATURE_COLUMNS
+
     train_df = features[(features["source_split"] == "train") & (features["is_trainable_demand_observation"].astype(bool))]
     eval_df = features[(features["source_split"] == "eval") & (features["is_trainable_demand_observation"].astype(bool))]
     train_df = sample_if_needed(train_df, args.max_train_rows, args.random_state)
@@ -229,14 +384,16 @@ def main() -> None:
 
     print(f"training rows: {len(train_df):,}")
     print(f"evaluation rows: {len(eval_df):,}")
+    print(f"feature columns: {len(feature_columns):,}")
     print(f"training {args.model_type} on {args.device}")
-    model = train_model(args, train_df)
+    model = train_model(args, train_df, feature_columns)
 
-    uncalibrated_metrics = evaluate_model(model, eval_df)
+    uncalibrated_metrics = evaluate_model(model, eval_df, feature_columns)
     calibration_factor = 1.0
     if not args.disable_eval_calibration:
-        calibration_factor = compute_calibration_factor(model, eval_df)
-    metrics = evaluate_model(model, eval_df, calibration_factor)
+        calibration_factor = compute_calibration_factor(model, eval_df, feature_columns)
+    metrics = evaluate_model(model, eval_df, feature_columns, calibration_factor)
+    segments = evaluate_segments(model, eval_df, feature_columns, calibration_factor)
 
     print("uncalibrated metrics")
     for key, value in uncalibrated_metrics.items():
@@ -250,17 +407,21 @@ def main() -> None:
     metrics_path = output_dir / f"{args.model_name}_{model_version}_metrics.json"
     metadata_path = output_dir / f"{args.model_name}_{model_version}_metadata.json"
 
-    total_predictions = write_predictions(model, features, prediction_path, args.prediction_batch_size, calibration_factor)
+    total_predictions = write_predictions(model, features, prediction_path, args.prediction_batch_size, feature_columns, calibration_factor)
     metrics["prediction_rows"] = float(total_predictions)
     metrics["calibration_factor"] = float(calibration_factor)
     metrics["uncalibrated"] = uncalibrated_metrics
+    metrics["segments"] = segments
 
     metadata = {
         "model_name": args.model_name,
         "model_version": model_version,
         "model_type": args.model_type,
         "device": args.device,
-        "feature_columns": FEATURE_COLUMNS,
+        "xgboost_objective": args.xgboost_objective if args.model_type == "xgboost" else None,
+        "tweedie_variance_power": args.tweedie_variance_power if args.model_type == "xgboost" and args.xgboost_objective == "reg:tweedie" else None,
+        "feature_columns": feature_columns,
+        "advanced_features_enabled": not args.disable_advanced_features,
         "target_definition": "observed hourly sales on non-stockout rows only",
         "calibration_factor": calibration_factor,
         "calibration_definition": "prediction scale factor = sum(eval observed demand) / sum(eval predicted demand) on non-stockout eval rows",
