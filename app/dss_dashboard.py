@@ -584,15 +584,20 @@ def render_action_grid(summary: pd.Series) -> None:
         ("Review demand", summary["review_bias_count"], "#2563eb"),
     ]
     cards = "".join(
-        f"""
-        <div class="action-card" style="border-top: 4px solid {color};">
-            <div class="action-label">{label}</div>
-            <div class="action-value">{metric_value(value)}</div>
-        </div>
-        """
+        f'<div class="action-card" style="border-top: 4px solid {color};">'
+        f'<div class="action-label">{label}</div>'
+        f'<div class="action-value">{metric_value(value)}</div>'
+        f'</div>'
         for label, value, color in items
     )
-    st.markdown(f"<div class=\"action-grid\">{cards}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-card">'
+        f'<div class="section-title">Action Mix</div>'
+        f'<div class="section-subtitle">How the current filter set distributes into operational decisions.</div>'
+        f'<div class="action-grid">{cards}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_hero(status: pd.Series, model_status: pd.DataFrame, failed_check_count: int) -> None:
@@ -705,12 +710,8 @@ def main() -> None:
         with kpi8:
             render_metric_card("Waste risk", metric_value(summary["avg_waste_risk_score"] * 100, "%"), "Slow-moving proxy risk", "#4f46e5")
 
-        st.markdown("<div class=\"section-card\">", unsafe_allow_html=True)
-        render_section_header("Action Mix", "How the current filter set distributes into operational decisions.")
         render_action_grid(summary)
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("<div class=\"section-card\">", unsafe_allow_html=True)
         render_section_header("What-if Policy Simulator", "Tune urgency and service-level assumptions without writing anything back to the warehouse.")
         what_if_col1, what_if_col2 = st.columns(2)
         urgency_threshold = what_if_col1.slider("Immediate restock urgency threshold", min_value=0.30, max_value=0.90, value=0.65, step=0.05)
@@ -721,7 +722,6 @@ def main() -> None:
         what2.metric("Increase Order Items", metric_value(what_if["increase_order_count"]))
         what3.metric("Markdown Items", metric_value(what_if["markdown_count"]))
         what4.metric("Restock Qty Proxy", metric_value(what_if["restock_order_qty_proxy"]))
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with actions_tab:
         render_section_header("Prioritized Action Queue", "Ranked store-product-date recommendations with explainable reasons and risk scores.")
