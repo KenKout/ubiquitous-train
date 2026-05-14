@@ -20,10 +20,12 @@ Do not use `100k` boosting rounds. For XGBoost/CatBoost, start with `600` to `10
 uv run python etl/load_fresh_retail_dw.py \
   --reset \
   --limit-rows-per-split 100000 \
-  --load-hourly
+  --load-hourly \
+  --hourly-workers 4
 ```
 
 This creates about `4.8M` hourly rows. If that is too slow, use `50000` or `10000` first.
+For `1000000` rows per split on Colab, keep `--hourly-workers 4` and avoid increasing workers unless disk write throughput remains stable.
 
 ## 3. Local: Export Model Features
 

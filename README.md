@@ -80,6 +80,27 @@ For a larger but still practical sample, use 10,000 rows per split:
 python3 etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 10000 --load-hourly
 ```
 
+For Colab or larger local machines, use parallel hourly expansion. Start with 4 workers; increase only if PostgreSQL and disk writes remain stable:
+
+```bash
+uv run python etl/load_fresh_retail_dw.py \
+  --reset \
+  --limit-rows-per-split 1000000 \
+  --load-hourly \
+  --hourly-workers 4
+```
+
+You can also restrict hourly expansion to a date window while keeping loaded staging/daily data:
+
+```bash
+uv run python etl/load_fresh_retail_dw.py \
+  --skip-staging \
+  --load-hourly \
+  --hourly-start-date 2024-06-01 \
+  --hourly-end-date 2024-07-02 \
+  --hourly-workers 4
+```
+
 ## Load The Full Daily Warehouse
 
 ```bash
@@ -92,6 +113,12 @@ The full hourly fact expands `4,850,000` daily rows into about `116,400,000` hou
 
 ```bash
 python3 etl/load_fresh_retail_dw.py --reset --load-hourly
+```
+
+On Colab, prefer:
+
+```bash
+uv run python etl/load_fresh_retail_dw.py --reset --load-hourly --hourly-workers 4
 ```
 
 ## Run The DSS Dashboard

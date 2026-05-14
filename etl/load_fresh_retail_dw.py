@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import date
 from io import StringIO
 from pathlib import Path
 
@@ -65,7 +68,71 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schema-only", action="store_true", help="Apply schema and exit.")
     parser.add_argument("--load-hourly", action="store_true", help="Populate hourly fact table. Full data expands to about 116M rows.")
     parser.add_argument("--skip-staging", action="store_true", help="Reuse existing staging rows and only build dimensions/facts.")
+    parser.add_argument("--hourly-workers", type=int, default=1, help="Parallel worker processes for hourly fact expansion by date.")
+    parser.add_argument("--hourly-start-date", default=None, help="Inclusive YYYY-MM-DD date filter for hourly fact expansion.")
+    parser.add_argument("--hourly-end-date", default=None, help="Inclusive YYYY-MM-DD date filter for hourly fact expansion.")
     return parser.parse_args()
+
+
+@dataclass(frozen=True)
+class DbConfig:
+    host: str
+    port: int
+    dbname: str
+    user: str
+    password: str
+
+
+HOURLY_FACT_SQL = """
+INSERT INTO dw.fact_sales_inventory_hourly (
+    date_key,
+    time_key,
+    store_key,
+    product_key,
+    source_split,
+    observed_sales_amount,
+    stockout_flag,
+    is_censored_observation,
+    discount_rate,
+    activity_flag,
+    precpt,
+    avg_temperature,
+    avg_humidity,
+    avg_wind_level
+)
+SELECT
+    d.date_key,
+    (hour_idx - 1)::SMALLINT AS time_key,
+    store.store_key,
+    product.product_key,
+    s.source_split,
+    s.hours_sale[hour_idx] AS observed_sales_amount,
+    s.hours_stock_status[hour_idx] = 1 AS stockout_flag,
+    s.hours_stock_status[hour_idx] = 1 AS is_censored_observation,
+    s.discount,
+    s.activity_flag,
+    s.precpt,
+    s.avg_temperature,
+    s.avg_humidity,
+    s.avg_wind_level
+FROM staging.fresh_retail_observation_day s
+JOIN dw.dim_date d ON d.full_date = s.dt
+JOIN dw.dim_store store ON store.store_id = s.store_id
+JOIN dw.dim_product product ON product.product_id = s.product_id
+CROSS JOIN LATERAL GENERATE_SUBSCRIPTS(s.hours_sale, 1) AS hour_idx
+WHERE s.dt = %s
+ON CONFLICT (date_key, time_key, store_key, product_key) DO UPDATE SET
+    source_split = EXCLUDED.source_split,
+    observed_sales_amount = EXCLUDED.observed_sales_amount,
+    stockout_flag = EXCLUDED.stockout_flag,
+    is_censored_observation = EXCLUDED.is_censored_observation,
+    discount_rate = EXCLUDED.discount_rate,
+    activity_flag = EXCLUDED.activity_flag,
+    precpt = EXCLUDED.precpt,
+    avg_temperature = EXCLUDED.avg_temperature,
+    avg_humidity = EXCLUDED.avg_humidity,
+    avg_wind_level = EXCLUDED.avg_wind_level;
+"""
 
 
 def connect(args: argparse.Namespace) -> psycopg.Connection:
@@ -75,6 +142,26 @@ def connect(args: argparse.Namespace) -> psycopg.Connection:
         dbname=args.dbname,
         user=args.user,
         password=args.password,
+    )
+
+
+def db_config_from_args(args: argparse.Namespace) -> DbConfig:
+    return DbConfig(
+        host=args.host,
+        port=args.port,
+        dbname=args.dbname,
+        user=args.user,
+        password=args.password,
+    )
+
+
+def connect_config(config: DbConfig) -> psycopg.Connection:
+    return psycopg.connect(
+        host=config.host,
+        port=config.port,
+        dbname=config.dbname,
+        user=config.user,
+        password=config.password,
     )
 
 
@@ -299,67 +386,97 @@ def populate_dimensions_and_daily_fact(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
-def populate_hourly_fact(conn: psycopg.Connection) -> None:
+def parse_date_arg(value: str | None) -> date | None:
+    if value is None:
+        return None
+    return pd.to_datetime(value).date()
+
+
+def get_hourly_dates(conn: psycopg.Connection, start_date: date | None, end_date: date | None) -> list[date]:
+    clauses: list[str] = []
+    params: list[date] = []
+    if start_date is not None:
+        clauses.append("full_date >= %s")
+        params.append(start_date)
+    if end_date is not None:
+        clauses.append("full_date <= %s")
+        params.append(end_date)
+    where_sql = ""
+    if clauses:
+        where_sql = "WHERE " + " AND ".join(clauses)
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT full_date FROM dw.dim_date {where_sql} ORDER BY full_date", tuple(params))
+        return [row[0] for row in cur.fetchall()]
+
+
+def populate_hourly_date(conn: psycopg.Connection, full_date: date) -> int:
+    with conn.cursor() as cur:
+        cur.execute(HOURLY_FACT_SQL, (full_date,))
+        inserted = cur.rowcount
+    conn.commit()
+    return int(inserted)
+
+
+def populate_hourly_worker(config: DbConfig, worker_id: int, dates: list[date]) -> tuple[int, int]:
+    total_rows = 0
+    with connect_config(config) as conn:
+        for index, full_date in enumerate(dates, start=1):
+            rows = populate_hourly_date(conn, full_date)
+            total_rows += rows
+            print(f"worker {worker_id}: populated hourly fact for {full_date} ({index}/{len(dates)}): {rows:,} rows")
+    return worker_id, total_rows
+
+
+def split_dates(dates: list[date], worker_count: int) -> list[list[date]]:
+    chunks = [[] for _ in range(worker_count)]
+    for index, full_date in enumerate(dates):
+        chunks[index % worker_count].append(full_date)
+    return [chunk for chunk in chunks if chunk]
+
+
+def populate_hourly_fact(
+    conn: psycopg.Connection,
+    config: DbConfig,
+    worker_count: int,
+    start_date: date | None,
+    end_date: date | None,
+) -> None:
+    dates = get_hourly_dates(conn, start_date, end_date)
+    if not dates:
+        print("no dates matched hourly fact filters")
+        return
+
+    worker_count = max(1, min(worker_count, len(dates)))
+    print(f"populating hourly fact for {len(dates):,} date(s) with {worker_count} worker(s)")
+
+    if worker_count == 1:
+        total_rows = 0
+        for index, full_date in enumerate(dates, start=1):
+            rows = populate_hourly_date(conn, full_date)
+            total_rows += rows
+            print(f"populated hourly fact for {full_date} ({index}/{len(dates)}): {rows:,} rows; total {total_rows:,}")
+        return
+
+    chunks = split_dates(dates, worker_count)
+    total_rows = 0
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(populate_hourly_worker, config, worker_id, chunk)
+            for worker_id, chunk in enumerate(chunks, start=1)
+        ]
+        for future in as_completed(futures):
+            worker_id, rows = future.result()
+            total_rows += rows
+            print(f"worker {worker_id} finished: {rows:,} rows; hourly total {total_rows:,}")
+
+
+def populate_hourly_fact_legacy(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT full_date FROM dw.dim_date ORDER BY full_date")
         dates = [row[0] for row in cur.fetchall()]
 
-    sql = """
-    INSERT INTO dw.fact_sales_inventory_hourly (
-        date_key,
-        time_key,
-        store_key,
-        product_key,
-        source_split,
-        observed_sales_amount,
-        stockout_flag,
-        is_censored_observation,
-        discount_rate,
-        activity_flag,
-        precpt,
-        avg_temperature,
-        avg_humidity,
-        avg_wind_level
-    )
-    SELECT
-        d.date_key,
-        (hour_idx - 1)::SMALLINT AS time_key,
-        store.store_key,
-        product.product_key,
-        s.source_split,
-        s.hours_sale[hour_idx] AS observed_sales_amount,
-        s.hours_stock_status[hour_idx] = 1 AS stockout_flag,
-        s.hours_stock_status[hour_idx] = 1 AS is_censored_observation,
-        s.discount,
-        s.activity_flag,
-        s.precpt,
-        s.avg_temperature,
-        s.avg_humidity,
-        s.avg_wind_level
-    FROM staging.fresh_retail_observation_day s
-    JOIN dw.dim_date d ON d.full_date = s.dt
-    JOIN dw.dim_store store ON store.store_id = s.store_id
-    JOIN dw.dim_product product ON product.product_id = s.product_id
-    CROSS JOIN LATERAL GENERATE_SUBSCRIPTS(s.hours_sale, 1) AS hour_idx
-    WHERE s.dt = %s
-    ON CONFLICT (date_key, time_key, store_key, product_key) DO UPDATE SET
-        source_split = EXCLUDED.source_split,
-        observed_sales_amount = EXCLUDED.observed_sales_amount,
-        stockout_flag = EXCLUDED.stockout_flag,
-        is_censored_observation = EXCLUDED.is_censored_observation,
-        discount_rate = EXCLUDED.discount_rate,
-        activity_flag = EXCLUDED.activity_flag,
-        precpt = EXCLUDED.precpt,
-        avg_temperature = EXCLUDED.avg_temperature,
-        avg_humidity = EXCLUDED.avg_humidity,
-        avg_wind_level = EXCLUDED.avg_wind_level;
-    """
-
     for index, full_date in enumerate(dates, start=1):
-        with conn.cursor() as cur:
-            cur.execute(sql, (full_date,))
-            inserted = cur.rowcount
-        conn.commit()
+        inserted = populate_hourly_date(conn, full_date)
         print(f"populated hourly fact for {full_date} ({index}/{len(dates)}): {inserted:,} rows")
 
 
@@ -385,6 +502,11 @@ def main() -> None:
     args = parse_args()
     data_dir = Path(args.data_dir)
     schema_file = Path(args.schema_file)
+    config = db_config_from_args(args)
+    hourly_start_date = parse_date_arg(args.hourly_start_date)
+    hourly_end_date = parse_date_arg(args.hourly_end_date)
+    if hourly_start_date and hourly_end_date and hourly_start_date > hourly_end_date:
+        raise ValueError("--hourly-start-date must be before or equal to --hourly-end-date")
 
     with connect(args) as conn:
         print("applying schema")
@@ -409,7 +531,7 @@ def main() -> None:
 
         if args.load_hourly:
             print("populating hourly fact; this can be large on the full dataset")
-            populate_hourly_fact(conn)
+            populate_hourly_fact(conn, config, args.hourly_workers, hourly_start_date, hourly_end_date)
         else:
             print("skipping hourly fact; pass --load-hourly to build it")
 

@@ -346,6 +346,12 @@ def metric_value_precise(value: Any, digits: int = 4, suffix: str = "") -> str:
     return f"{float(value):,.{digits}f}{suffix}"
 
 
+def metric_percent(value: Any, digits: int = 2) -> str:
+    if pd.isna(value):
+        return "n/a"
+    return f"{float(value) * 100:,.{digits}f}%"
+
+
 def coerce_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     result = df.copy()
     for column in columns:
@@ -730,7 +736,7 @@ def main() -> None:
             )
             st.dataframe(
                 recommendations,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "stockout_rate_6_22": st.column_config.ProgressColumn("Stockout 6-21", min_value=0, max_value=1),
@@ -762,7 +768,7 @@ def main() -> None:
                 chart_df = coerce_numeric_columns(category_summary, category_columns)
                 chart_df["first_category_id"] = chart_df["first_category_id"].astype(str)
                 st.bar_chart(chart_df, x="first_category_id", y=category_columns, height=360)
-                st.dataframe(chart_df, use_container_width=True, hide_index=True)
+                st.dataframe(chart_df, width="stretch", hide_index=True)
             else:
                 st.info("No category data for the selected filters.")
 
@@ -800,7 +806,7 @@ def main() -> None:
                     st.line_chart(hourly_numeric, x="hour_of_day", y=["observed_sales_amount", "estimated_true_demand", "estimated_lost_sales"], height=360)
                 with stock_col:
                     st.bar_chart(hourly_numeric, x="hour_of_day", y="stockout_flag", height=360)
-                st.dataframe(hourly, use_container_width=True, hide_index=True)
+                st.dataframe(hourly, width="stretch", hide_index=True)
 
     with quality_tab:
         model_col, data_col = st.columns([1.15, 1])
@@ -813,7 +819,7 @@ def main() -> None:
                 mq1, mq2, mq3 = st.columns(3)
                 mq1.metric("Eval Rows", metric_value(quality["eval_rows"]))
                 mq2.metric("WMAPE", metric_value_precise(quality["wmape"], 4))
-                mq3.metric("Bias", metric_value_precise(quality["bias"] * 100, 2, "%"))
+                mq3.metric("Bias", metric_percent(quality["bias"], 2))
                 mq4, mq5, mq6 = st.columns(3)
                 mq4.metric("Calibration", metric_value_precise(quality["calibration_factor"], 4))
                 mq5.metric("MAE", metric_value_precise(quality["mae"], 4))
@@ -822,14 +828,14 @@ def main() -> None:
                     st.warning("Model error is high. Use recommendations as risk ranking and decision support, not exact order optimization.")
                 if pd.notna(quality["bias"]) and abs(float(quality["bias"])) <= 0.05:
                     st.success("Aggregate demand bias is within +/-5%, suitable for DSS-level lost-sales and action-priority reporting.")
-                st.dataframe(model_quality, use_container_width=True, hide_index=True)
+                st.dataframe(model_quality, width="stretch", hide_index=True)
         with data_col:
             render_section_header("Warehouse Quality", "Data contract checks for arrays, grain, and stockout-count consistency.")
             if failed_checks.empty:
                 st.success("All loaded warehouse quality checks passed.")
             else:
                 st.error(f"{len(failed_checks)} quality check(s) failed.")
-            st.dataframe(quality_checks, use_container_width=True, hide_index=True)
+            st.dataframe(quality_checks, width="stretch", hide_index=True)
 
         with st.expander("How DSS scores are calculated"):
             st.markdown(
