@@ -476,23 +476,6 @@ CREATE OR REPLACE VIEW dw.v_dss_daily_decision_score AS
 WITH latest_model AS (
     SELECT model_key, model_name, model_version
     FROM dw.v_latest_model_with_predictions
-), hourly_daily AS (
-    SELECT
-        date_key,
-        store_key,
-        product_key,
-        MAX(model_key) AS model_key,
-        MAX(model_name) AS model_name,
-        MAX(model_version) AS model_version,
-        CASE
-            WHEN BOOL_OR(estimate_source = 'model') THEN 'model'
-            ELSE 'heuristic'
-        END AS estimate_source,
-        SUM(estimated_true_demand) AS estimated_true_demand,
-        SUM(estimated_lost_sales) AS estimated_lost_sales,
-        SUM(CASE WHEN stockout_flag THEN 1 ELSE 0 END) AS stockout_hours_total_from_hourly
-    FROM dw.v_dss_hourly_demand_estimate
-    GROUP BY date_key, store_key, product_key
 ), enriched AS (
     SELECT
         d.full_date,
@@ -507,12 +490,12 @@ WITH latest_model AS (
         f.store_key,
         f.product_key,
         f.source_split,
-        h.model_name,
-        h.model_version,
-        COALESCE(h.estimate_source, 'daily_fact_only') AS estimate_source,
+        lm.model_name,
+        lm.model_version,
+        CASE WHEN r.model_key IS NOT NULL THEN 'model' ELSE 'daily_fact_only' END AS estimate_source,
         f.observed_daily_sales_amount,
-        COALESCE(h.estimated_true_demand, f.observed_daily_sales_amount) AS estimated_true_demand,
-        COALESCE(h.estimated_lost_sales, 0) AS estimated_lost_sales,
+        COALESCE(r.expected_demand, f.observed_daily_sales_amount) AS estimated_true_demand,
+        COALESCE(r.expected_lost_sales, 0) AS estimated_lost_sales,
         f.stockout_hours_6_22,
         f.stockout_hours_total,
         f.has_stockout,
@@ -535,10 +518,6 @@ WITH latest_model AS (
     JOIN dw.dim_city city ON city.city_key = store.city_key
     JOIN dw.dim_product product ON product.product_key = f.product_key
     LEFT JOIN latest_model lm ON TRUE
-    LEFT JOIN hourly_daily h
-        ON h.date_key = f.date_key
-        AND h.store_key = f.store_key
-        AND h.product_key = f.product_key
     LEFT JOIN dw.fact_replenishment_recommendation_daily r
         ON r.model_key = lm.model_key
         AND r.date_key = f.date_key
