@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
+from html import escape
 from typing import Any
 
+import altair as alt
 import pandas as pd
 import psycopg
 import streamlit as st
@@ -76,6 +78,13 @@ def load_model_quality() -> pd.DataFrame:
             q.wmape,
             q.bias,
             q.calibration_factor,
+            (
+                SELECT MAX(e.metric_value)
+                FROM dw.fact_model_evaluation e
+                WHERE e.model_key = q.model_key
+                  AND e.evaluation_split = 'eval'
+                  AND e.metric_name = 'raw_calibration_factor'
+            ) AS raw_calibration_factor,
             q.prediction_rows,
             q.uncalibrated_wmape,
             q.uncalibrated_bias,
@@ -201,7 +210,67 @@ def load_category_summary(where_sql: str, params: tuple[Any, ...]) -> pd.DataFra
 
 
 @st.cache_data(ttl=60)
-def load_recommendations(where_sql: str, params: tuple[Any, ...]) -> pd.DataFrame:
+def load_recommendations(where_sql: str, params: tuple[Any, ...], queue_view: str) -> pd.DataFrame:
+    if queue_view == "Diverse action sample":
+        return run_query(
+            f"""
+            WITH filtered AS (
+                SELECT
+                    full_date,
+                    city_id,
+                    store_id,
+                    product_id,
+                    first_category_id,
+                    model_name,
+                    model_version,
+                    estimate_source,
+                    observed_daily_sales_amount,
+                    estimated_true_demand,
+                    estimated_lost_sales,
+                    recommended_order_qty,
+                    stockout_hours_6_22,
+                    stockout_rate_6_22,
+                    demand_bias_rate,
+                    waste_risk_score,
+                    restock_urgency_score,
+                    service_level_target,
+                    expected_waste_qty,
+                    activity_flag,
+                    decision_action,
+                    decision_reason,
+                    inventory_proxy_note
+                FROM dw.v_dss_daily_decision_score
+                WHERE {where_sql}
+            ), ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY decision_action
+                        ORDER BY restock_urgency_score DESC, estimated_lost_sales DESC, stockout_hours_6_22 DESC
+                    ) AS action_rank
+                FROM filtered
+            )
+            SELECT *
+            FROM ranked
+            WHERE action_rank <= 40
+            ORDER BY
+                CASE decision_action
+                    WHEN 'Restock immediately' THEN 1
+                    WHEN 'Increase next order' THEN 2
+                    WHEN 'Review censored demand' THEN 3
+                    WHEN 'Reduce order or markdown' THEN 4
+                    ELSE 5
+                END,
+                restock_urgency_score DESC,
+                estimated_lost_sales DESC
+            LIMIT 200
+            """,
+            params,
+        ).drop(columns=["action_rank"], errors="ignore")
+
+    extra_filter = ""
+    if queue_view == "Exclude full-stockout rows":
+        extra_filter = "AND NOT (stockout_hours_6_22 = 16 AND observed_daily_sales_amount = 0)"
     return run_query(
         f"""
         SELECT
@@ -224,11 +293,13 @@ def load_recommendations(where_sql: str, params: tuple[Any, ...]) -> pd.DataFram
             restock_urgency_score,
             service_level_target,
             expected_waste_qty,
+            activity_flag,
             decision_action,
             decision_reason,
             inventory_proxy_note
         FROM dw.v_dss_daily_decision_score
         WHERE {where_sql}
+          {extra_filter}
         ORDER BY restock_urgency_score DESC, estimated_lost_sales DESC, stockout_hours_6_22 DESC
         LIMIT 200
         """,
@@ -358,6 +429,14 @@ def coerce_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame
         if column in result.columns:
             result[column] = pd.to_numeric(result[column], errors="coerce").astype(float)
     return result
+
+
+def full_stockout_zero_sales_count(df: pd.DataFrame) -> int:
+    if df.empty or "stockout_hours_6_22" not in df.columns or "observed_daily_sales_amount" not in df.columns:
+        return 0
+    stockout_hours = pd.to_numeric(df["stockout_hours_6_22"], errors="coerce").fillna(0)
+    observed_sales = pd.to_numeric(df["observed_daily_sales_amount"], errors="coerce").fillna(0)
+    return int(((stockout_hours >= 16) & (observed_sales <= 0)).sum())
 
 
 def inject_css() -> None:
@@ -526,6 +605,301 @@ def inject_css() -> None:
             margin-top: 6px;
         }
 
+        .insight-panel {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 54%, #334155 100%);
+            color: #f8fafc;
+            border-radius: 22px;
+            padding: 22px;
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            box-shadow: 0 22px 58px rgba(15, 23, 42, 0.18);
+            margin-bottom: 16px;
+        }
+
+        .insight-kicker {
+            color: #93c5fd;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 8px;
+        }
+
+        .insight-title {
+            font-size: 1.35rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .insight-copy {
+            color: #cbd5e1;
+            font-size: 0.95rem;
+            max-width: 980px;
+        }
+
+        .lane-grid,
+        .priority-grid,
+        .category-card-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 14px;
+            margin: 14px 0 20px;
+        }
+
+        .lane-card,
+        .priority-card,
+        .category-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            box-shadow: 0 14px 34px rgba(15, 23, 42, 0.07);
+            padding: 16px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .lane-card::before,
+        .priority-card::before,
+        .category-card::before {
+            content: "";
+            position: absolute;
+            inset: 0 0 auto 0;
+            height: 4px;
+            background: var(--accent);
+        }
+
+        .card-eyebrow {
+            color: #64748b;
+            font-size: 0.76rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 8px;
+        }
+
+        .card-title {
+            color: #0f172a;
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .card-subtitle {
+            color: #64748b;
+            font-size: 0.84rem;
+            margin-bottom: 12px;
+        }
+
+        .card-stat-row {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin: 10px 0 12px;
+        }
+
+        .mini-stat {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 10px;
+        }
+
+        .mini-label {
+            color: #64748b;
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 700;
+        }
+
+        .mini-value {
+            color: #0f172a;
+            font-family: 'Fira Code', monospace;
+            font-weight: 700;
+            font-size: 0.95rem;
+            margin-top: 3px;
+        }
+
+        .signal-row {
+            margin-top: 8px;
+        }
+
+        .signal-head {
+            display: flex;
+            justify-content: space-between;
+            color: #475569;
+            font-size: 0.76rem;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+
+        .signal-track {
+            height: 8px;
+            border-radius: 999px;
+            background: #e2e8f0;
+            overflow: hidden;
+        }
+
+        .signal-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: var(--accent);
+            width: var(--width);
+        }
+
+        .reason-box {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 14px;
+            color: #475569;
+            font-size: 0.82rem;
+            padding: 10px 12px;
+            min-height: 58px;
+        }
+
+        .hour-strip {
+            display: grid;
+            grid-template-columns: repeat(24, minmax(0, 1fr));
+            gap: 4px;
+            margin: 12px 0 16px;
+        }
+
+        .hour-cell {
+            min-height: 42px;
+            border-radius: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: #0f172a;
+            border: 1px solid #e2e8f0;
+            background: var(--cell-bg);
+        }
+
+        .soft-note {
+            color: #64748b;
+            font-size: 0.84rem;
+            margin-top: -4px;
+            margin-bottom: 12px;
+        }
+
+        .evidence-hero {
+            display: grid;
+            grid-template-columns: 1.15fr 0.85fr;
+            gap: 14px;
+            margin: 8px 0 16px;
+        }
+
+        .selection-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin: 12px 0 16px;
+        }
+
+        .selection-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 16px;
+            padding: 14px 16px;
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.05);
+            border-top: 4px solid var(--accent);
+        }
+
+        .selection-label {
+            color: #64748b;
+            font-size: 0.72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 7px;
+        }
+
+        .selection-value {
+            color: #0f172a;
+            font-size: 1.05rem;
+            font-weight: 800;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
+        }
+
+        .evidence-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            padding: 16px;
+            box-shadow: 0 12px 32px rgba(15, 23, 42, 0.06);
+        }
+
+        .evidence-kicker {
+            color: #64748b;
+            font-size: 0.72rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+
+        .evidence-title {
+            color: #0f172a;
+            font-size: 1.18rem;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+
+        .evidence-copy {
+            color: #475569;
+            font-size: 0.92rem;
+            line-height: 1.5;
+        }
+
+        .evidence-pill-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .evidence-pill {
+            border-radius: 999px;
+            border: 1px solid #dbeafe;
+            background: #eff6ff;
+            color: #1e3a8a;
+            padding: 6px 10px;
+            font-size: 0.78rem;
+            font-weight: 700;
+        }
+
+        .legend-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 8px 0 14px;
+        }
+
+        .legend-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #475569;
+            font-size: 0.8rem;
+            font-weight: 700;
+        }
+
+        .legend-swatch {
+            width: 18px;
+            height: 8px;
+            border-radius: 999px;
+            background: var(--swatch);
+        }
+
+        .evidence-table-note {
+            color: #64748b;
+            font-size: 0.82rem;
+            margin-top: 8px;
+        }
+
         div[data-testid="stMetric"] {
             background: #ffffff;
             border: 1px solid #e2e8f0;
@@ -541,11 +915,18 @@ def inject_css() -> None:
         @media (max-width: 900px) {
             .hero-title { font-size: 1.65rem; }
             .action-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .evidence-hero { grid-template-columns: 1fr; }
+            .selection-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .lane-grid,
+            .priority-grid,
+            .category-card-grid { grid-template-columns: 1fr; }
         }
 
         @media (max-width: 520px) {
             .action-grid { grid-template-columns: 1fr; }
             .hero-panel { padding: 22px; }
+            .selection-grid { grid-template-columns: 1fr; }
+            .hour-strip { grid-template-columns: repeat(12, minmax(0, 1fr)); }
         }
         </style>
         """,
@@ -597,6 +978,451 @@ def render_action_grid(summary: pd.Series) -> None:
         f'<div class="action-grid">{cards}</div>'
         f'</div>',
         unsafe_allow_html=True,
+    )
+
+
+ACTION_META = {
+    "Restock immediately": {"accent": "#dc2626", "label": "Restock"},
+    "Increase next order": {"accent": "#f59e0b", "label": "Increase"},
+    "Reduce order or markdown": {"accent": "#7c3aed", "label": "Markdown"},
+    "Review censored demand": {"accent": "#2563eb", "label": "Review"},
+    "Maintain plan": {"accent": "#64748b", "label": "Maintain"},
+}
+
+ACTION_DISPLAY = {
+    "All actions": "All actions",
+    "Restock immediately": "Restock immediately",
+    "Increase next order": "Increase next replenishment",
+    "Reduce order or markdown": "Reduce order / markdown",
+    "Review censored demand": "Review censored demand",
+    "Maintain plan": "Maintain plan",
+}
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp01(value: Any) -> float:
+    return min(max(safe_float(value), 0.0), 1.0)
+
+
+def percent_label(value: Any, digits: int = 0) -> str:
+    return f"{clamp01(value) * 100:,.{digits}f}%"
+
+
+def action_accent(action: Any) -> str:
+    return ACTION_META.get(str(action), {"accent": "#475569"})["accent"]
+
+
+def display_action_label(action: Any) -> str:
+    return ACTION_DISPLAY.get(str(action), str(action))
+
+
+def compact_html(html: str) -> str:
+    return " ".join(line.strip() for line in html.splitlines() if line.strip())
+
+
+def render_html(html: str) -> None:
+    st.markdown(compact_html(html), unsafe_allow_html=True)
+
+
+def signal_bar(label: str, value: Any, color: str) -> str:
+    pct = percent_label(value)
+    return (
+        f'<div class="signal-row">'
+        f'<div class="signal-head"><span>{escape(label)}</span><span>{pct}</span></div>'
+        f'<div class="signal-track"><div class="signal-fill" style="--accent: {color}; --width: {pct};"></div></div>'
+        f'</div>'
+    )
+
+
+def render_queue_insight(summary: pd.Series, recommendations: pd.DataFrame, queue_view: str) -> None:
+    full_stockout_count = full_stockout_zero_sales_count(recommendations)
+    total_visible = len(recommendations)
+    estimated_lost_sales = safe_float(summary.get("estimated_lost_sales"))
+    immediate_count = int(safe_float(summary.get("immediate_restock_count")))
+    urgency = percent_label(summary.get("avg_restock_urgency_score"), 1)
+    if total_visible and full_stockout_count == total_visible:
+        title = "Your top queue is dominated by true full-stockout days"
+        copy = "Every visible priority card has zero observed sales and stockout flags across all business hours. That is why the stockout and lost-demand share signals saturate at 100%."
+    elif full_stockout_count:
+        title = "Mixed queue with a full-stockout cluster"
+        copy = f"{full_stockout_count:,} of {total_visible:,} visible items are full business-hour stockouts. Use the cards below to separate structural stockout risk from softer review/markdown actions."
+    else:
+        title = "Queue is no longer saturated by full-stockout rows"
+        copy = "The visible recommendations contain partial-stockout or non-stockout cases, which should make the signal bars more varied and easier to compare."
+    render_html(
+        f"""
+        <div class="insight-panel">
+            <div class="insight-kicker">{escape(queue_view)} view</div>
+            <div class="insight-title">{escape(title)}</div>
+            <div class="insight-copy">
+                {escape(copy)} Current filter window contains {immediate_count:,} immediate-restock candidates,
+                {metric_value(estimated_lost_sales)} estimated lost sales, and {urgency} average priority.
+            </div>
+        </div>
+        """
+    )
+
+
+def render_action_lanes(recommendations: pd.DataFrame) -> None:
+    if recommendations.empty:
+        return
+    grouped = (
+        recommendations.groupby("decision_action", dropna=False)
+        .agg(
+            rows=("decision_action", "size"),
+            lost_sales=("estimated_lost_sales", "sum"),
+            avg_priority=("restock_urgency_score", "mean"),
+            avg_stockout=("stockout_rate_6_22", "mean"),
+        )
+        .reset_index()
+    )
+    action_order = {name: index for index, name in enumerate(ACTION_META)}
+    grouped["sort_order"] = grouped["decision_action"].map(action_order).fillna(99)
+    grouped = grouped.sort_values(["sort_order", "lost_sales"], ascending=[True, False])
+    cards = []
+    for _, row in grouped.iterrows():
+        action_name = str(row["decision_action"])
+        action_label = display_action_label(action_name)
+        accent = action_accent(action_name)
+        cards.append(
+            f"""
+            <div class="lane-card" style="--accent: {accent};">
+                <div class="card-eyebrow">Action lane</div>
+                <div class="card-title">{escape(action_label)}</div>
+                <div class="card-subtitle">{int(row['rows']):,} visible recommendations</div>
+                <div class="card-stat-row">
+                    <div class="mini-stat"><div class="mini-label">Lost sales</div><div class="mini-value">{metric_value(row['lost_sales'])}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Priority</div><div class="mini-value">{percent_label(row['avg_priority'])}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Stockout</div><div class="mini-value">{percent_label(row['avg_stockout'])}</div></div>
+                </div>
+                {signal_bar('Lane priority', row['avg_priority'], accent)}
+            </div>
+            """
+        )
+    render_html(
+        f'<div class="section-title">Action Lanes</div>'
+        f'<div class="section-subtitle">A management view of what kind of intervention the queue is asking for.</div>'
+        f'<div class="lane-grid">{"".join(cards)}</div>'
+    )
+
+
+def render_priority_cards(recommendations: pd.DataFrame, limit: int = 6) -> None:
+    if recommendations.empty:
+        return
+    cards = []
+    for index, (_, row) in enumerate(recommendations.head(limit).iterrows(), start=1):
+        action_name = str(row["decision_action"])
+        action_label = display_action_label(action_name)
+        accent = action_accent(action_name)
+        title = f"#{index} Store {int(row['store_id'])} / Product {int(row['product_id'])}"
+        subtitle = f"{row['full_date']} · category {int(row['first_category_id'])} · {action_label}"
+        
+        # Tính breakdown urgency score
+        stockout_rate = safe_float(row['stockout_rate_6_22'])
+        bias_rate = safe_float(row['demand_bias_rate'])
+        activity = safe_float(row['activity_flag'])
+        
+        stockout_contrib = stockout_rate * 0.55
+        bias_contrib = bias_rate * 0.35
+        activity_contrib = 0.10 if activity != 0 else 0.0
+        total_urgency = min(1.0, stockout_contrib + bias_contrib + activity_contrib)
+        
+        urgency_breakdown = (
+            f"Stockout rate ({stockout_rate:.1%}) × 0.55 = {stockout_contrib:.3f}  "
+            f"|  Bias rate ({bias_rate:.1%}) × 0.35 = {bias_contrib:.3f}  "
+            f"|  Activity ({int(activity)}) × 0.10 = {activity_contrib:.3f}  "
+            f"|  Total = {total_urgency:.3f}"
+        )
+        
+        cards.append(
+            f"""
+            <div class="priority-card" style="--accent: {accent};">
+                <div class="card-eyebrow">Priority card</div>
+                <div class="card-title">{escape(title)}</div>
+                <div class="card-subtitle">{escape(subtitle)}</div>
+                <div class="card-stat-row">
+                    <div class="mini-stat"><div class="mini-label">Lost sales</div><div class="mini-value">{metric_value(row['estimated_lost_sales'])}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Order proxy</div><div class="mini-value">{metric_value(row['recommended_order_qty'])}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Stockout hrs</div><div class="mini-value">{int(safe_float(row['stockout_hours_6_22']))}/16</div></div>
+                </div>
+                {signal_bar('Business-hour stockout', row['stockout_rate_6_22'], '#dc2626')}
+                {signal_bar('Lost demand share', row['demand_bias_rate'], '#ea580c')}
+                {signal_bar('Priority score', row['restock_urgency_score'], accent)}
+                <div class="urgency-breakdown" style="font-size: 0.75rem; color: #6b7280; margin-top: 0.5rem; padding: 0.5rem; background: #f3f4f6; border-radius: 0.25rem;">
+                    <strong>Urgency breakdown:</strong><br/>
+                    {escape(urgency_breakdown)}
+                </div>
+                <div class="reason-box">{escape(str(row['decision_reason']))}</div>
+            </div>
+            """
+        )
+    render_html(
+        f'<div class="section-title">Top Intervention Cards</div>'
+        f'<div class="section-subtitle">The queue as operational cards instead of raw rows. Use these to pick what to inspect in hourly evidence.</div>'
+        f'<div class="priority-grid">{"".join(cards)}</div>'
+    )
+
+
+def render_category_cards(category_summary: pd.DataFrame, limit: int = 6) -> None:
+    if category_summary.empty:
+        return
+    cards = []
+    for _, row in category_summary.head(limit).iterrows():
+        urgency = clamp01(row["restock_urgency_score"])
+        accent = "#dc2626" if urgency >= 0.65 else "#f59e0b" if urgency >= 0.35 else "#2563eb"
+        cards.append(
+            f"""
+            <div class="category-card" style="--accent: {accent};">
+                <div class="card-eyebrow">Category pressure</div>
+                <div class="card-title">Category {int(row['first_category_id'])}</div>
+                <div class="card-subtitle">{int(row['product_store_days']):,} product-store-days</div>
+                <div class="card-stat-row">
+                    <div class="mini-stat"><div class="mini-label">Lost sales</div><div class="mini-value">{metric_value(row['estimated_lost_sales'])}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Urgency</div><div class="mini-value">{percent_label(row['restock_urgency_score'])}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Stockout</div><div class="mini-value">{percent_label(row['stockout_rate_6_22'])}</div></div>
+                </div>
+                {signal_bar('Waste risk', row['waste_risk_score'], '#7c3aed')}
+            </div>
+            """
+        )
+    render_html(f'<div class="category-card-grid">{"".join(cards)}</div>')
+
+
+def render_selection_overview(selected_row: pd.Series) -> None:
+    action_label = display_action_label(selected_row["decision_action"])
+    accent = action_accent(selected_row["decision_action"])
+    
+    # Tính breakdown urgency score
+    stockout_rate = safe_float(selected_row['stockout_rate_6_22'])
+    bias_rate = safe_float(selected_row['demand_bias_rate'])
+    activity = safe_float(selected_row['activity_flag'])
+    
+    stockout_contrib = stockout_rate * 0.55
+    bias_contrib = bias_rate * 0.35
+    activity_contrib = 0.10 if activity != 0 else 0.0
+    total_urgency = min(1.0, stockout_contrib + bias_contrib + activity_contrib)
+    
+    urgency_detail = (
+        f"Stockout: {stockout_rate:.1%} × 0.55 = {stockout_contrib:.3f} | "
+        f"Bias: {bias_rate:.1%} × 0.35 = {bias_contrib:.3f} | "
+        f"Activity: {int(activity)} × 0.10 = {activity_contrib:.3f}"
+    )
+    
+    cards = [
+        ("Store", str(int(selected_row["store_id"])), "#1e40af"),
+        ("Product", str(int(selected_row["product_id"])), "#0f766e"),
+        ("Action", action_label, accent),
+        ("Urgency", metric_value(safe_float(selected_row["restock_urgency_score"]) * 100, "%"), "#7c3aed"),
+    ]
+    html = "".join(
+        f"""
+        <div class="selection-card" style="--accent: {color};">
+            <div class="selection-label">{escape(label)}</div>
+            <div class="selection-value">{escape(value)}</div>
+        </div>
+        """
+        for label, value, color in cards
+    )
+    render_html(
+        f'<div class="selection-grid">{html}</div>'
+        f'<div style="margin-top: 0.75rem; padding: 0.75rem; background: #f3f4f6; border-radius: 0.5rem; font-size: 0.8rem; color: #374151;">'
+        f'<strong>Urgency Score Breakdown:</strong> {escape(urgency_detail)}'
+        f'</div>'
+    )
+
+
+def format_hour_range(hours: list[int]) -> str:
+    if not hours:
+        return "none"
+    hours = sorted(hours)
+    ranges: list[str] = []
+    start = previous = hours[0]
+    for hour in hours[1:]:
+        if hour == previous + 1:
+            previous = hour
+            continue
+        ranges.append(f"{start}:00" if start == previous else f"{start}:00-{previous}:00")
+        start = previous = hour
+    ranges.append(f"{start}:00" if start == previous else f"{start}:00-{previous}:00")
+    return ", ".join(ranges)
+
+
+def hourly_status(row: pd.Series) -> str:
+    stockout = safe_float(row.get("stockout_flag")) >= 1
+    lost = safe_float(row.get("estimated_lost_sales"))
+    observed = safe_float(row.get("observed_sales_amount"))
+    if stockout and lost > 0:
+        return "Stockout, demand recovered"
+    if stockout:
+        return "Stockout observed"
+    if observed > 0:
+        return "Observed sale"
+    return "No sale observed"
+
+
+def prepare_hourly_evidence_table(hourly_numeric: pd.DataFrame) -> pd.DataFrame:
+    evidence = hourly_numeric.copy()
+    evidence["hour"] = evidence["hour_of_day"].astype(int).map(lambda hour: f"{hour:02d}:00")
+    evidence["status"] = evidence.apply(hourly_status, axis=1)
+    evidence["recovered_gap"] = (evidence["estimated_true_demand"] - evidence["observed_sales_amount"]).clip(lower=0)
+    evidence["stockout_flag"] = evidence["stockout_flag"].map(lambda value: safe_float(value) >= 1)
+    return evidence[
+        [
+            "hour",
+            "status",
+            "observed_sales_amount",
+            "estimated_true_demand",
+            "estimated_lost_sales",
+            "stockout_flag",
+            "estimate_source",
+        ]
+    ]
+
+
+def render_hourly_evidence_chart(hourly_numeric: pd.DataFrame) -> None:
+    chart_df = hourly_numeric.copy()
+    chart_df["hour_label"] = chart_df["hour_of_day"].astype(int).map(lambda hour: f"{hour:02d}:00")
+    chart_df["stockout_status"] = chart_df["stockout_flag"].map(lambda value: "Stockout" if safe_float(value) >= 1 else "Available")
+    line_df = chart_df.melt(
+        id_vars=["hour_of_day", "hour_label", "stockout_status", "estimated_lost_sales"],
+        value_vars=["observed_sales_amount", "estimated_true_demand"],
+        var_name="series",
+        value_name="amount",
+    )
+    line_df["series"] = line_df["series"].map(
+        {
+            "observed_sales_amount": "Observed sales",
+            "estimated_true_demand": "Estimated demand",
+        }
+    )
+
+    x_axis = alt.X("hour_label:N", title="Hour", sort=chart_df["hour_label"].tolist(), axis=alt.Axis(labelAngle=0))
+    lost_bars = (
+        alt.Chart(chart_df)
+        .mark_bar(opacity=0.44, cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=x_axis,
+            y=alt.Y("estimated_lost_sales:Q", title="Sales / demand units"),
+            color=alt.value("#f59e0b"),
+            tooltip=[
+                alt.Tooltip("hour_label:N", title="Hour"),
+                alt.Tooltip("stockout_status:N", title="Source status"),
+                alt.Tooltip("estimated_lost_sales:Q", title="Recovered lost sales", format=".4f"),
+            ],
+        )
+    )
+    demand_lines = (
+        alt.Chart(line_df)
+        .mark_line(point=True, strokeWidth=3)
+        .encode(
+            x=x_axis,
+            y=alt.Y("amount:Q", title="Sales / demand units"),
+            color=alt.Color(
+                "series:N",
+                title="Demand signal",
+                scale=alt.Scale(domain=["Observed sales", "Estimated demand"], range=["#475569", "#2563eb"]),
+            ),
+            strokeDash=alt.StrokeDash("series:N", scale=alt.Scale(domain=["Observed sales", "Estimated demand"], range=[[1, 0], [6, 3]]), legend=None),
+            tooltip=[
+                alt.Tooltip("hour_label:N", title="Hour"),
+                alt.Tooltip("stockout_status:N", title="Source status"),
+                alt.Tooltip("series:N", title="Signal"),
+                alt.Tooltip("amount:Q", title="Value", format=".4f"),
+            ],
+        )
+    )
+    chart = (lost_bars + demand_lines).resolve_scale(y="shared").properties(height=330)
+    st.altair_chart(chart, use_container_width=True)
+
+
+def render_hourly_story(selected_row: pd.Series, hourly_numeric: pd.DataFrame) -> None:
+    stockout_hours = int(pd.to_numeric(hourly_numeric["stockout_flag"], errors="coerce").fillna(0).sum())
+    business_hours = hourly_numeric[(hourly_numeric["hour_of_day"] >= 6) & (hourly_numeric["hour_of_day"] <= 21)]
+    business_stockout_hours = int(pd.to_numeric(business_hours["stockout_flag"], errors="coerce").fillna(0).sum()) if not business_hours.empty else 0
+    lost_sales = safe_float(hourly_numeric["estimated_lost_sales"].sum())
+    observed_sales = safe_float(hourly_numeric["observed_sales_amount"].sum())
+    estimated_demand = safe_float(hourly_numeric["estimated_true_demand"].sum())
+    peak_lost = hourly_numeric.loc[hourly_numeric["estimated_lost_sales"].idxmax()]
+    peak_hour = int(peak_lost["hour_of_day"])
+    stockout_hour_list = hourly_numeric.loc[hourly_numeric["stockout_flag"] >= 1, "hour_of_day"].astype(int).tolist()
+    lost_hour_list = hourly_numeric.loc[hourly_numeric["estimated_lost_sales"] > 0, "hour_of_day"].astype(int).tolist()
+    action_label = display_action_label(selected_row["decision_action"])
+    accent = action_accent(selected_row["decision_action"])
+
+    if stockout_hours == 0:
+        readout = "No source stockout hours are present for this store-product-day. The recommendation is driven by non-stockout demand, waste, or queue context."
+    elif lost_sales <= 0:
+        readout = "Source stockout flags are present, but the model/fallback did not recover material lost sales for those hours. Treat this as a stockout evidence check."
+    else:
+        readout = (
+            f"Stockout is observed during {format_hour_range(stockout_hour_list)}. "
+            f"The model recovers lost demand during {format_hour_range(lost_hour_list)}, with the peak lost-sales signal at {peak_hour}:00."
+        )
+
+    explanation = (
+        f"Observed sales total {metric_value(observed_sales)}, estimated demand totals {metric_value(estimated_demand)}, "
+        f"and the recovered gap is {metric_value(lost_sales)}. This supports the action: {action_label}."
+    )
+    cells = []
+    for _, row in hourly_numeric.iterrows():
+        hour = int(row["hour_of_day"])
+        stockout = safe_float(row["stockout_flag"]) >= 1
+        lost = safe_float(row["estimated_lost_sales"])
+        if stockout:
+            bg = "#fecaca" if 6 <= hour <= 21 else "#fee2e2"
+        elif lost > 0:
+            bg = "#fde68a"
+        else:
+            bg = "#dbeafe"
+        label = f"{hour:02d}"
+        cells.append(f'<div class="hour-cell" style="--cell-bg: {bg};" title="hour {hour}, lost sales {lost:.3f}">{label}</div>')
+    render_html(
+        f"""
+        <div class="evidence-hero">
+            <div class="evidence-card" style="border-top: 4px solid {accent};">
+                <div class="evidence-kicker">Why this action</div>
+                <div class="evidence-title">{escape(action_label)} for store {int(selected_row['store_id'])} / product {int(selected_row['product_id'])}</div>
+                <div class="evidence-copy">{escape(readout)} {escape(explanation)}</div>
+                <div class="evidence-pill-row">
+                    <span class="evidence-pill">Date {escape(str(selected_row['full_date']))}</span>
+                    <span class="evidence-pill">Stockout {stockout_hours}/24h</span>
+                    <span class="evidence-pill">Business stockout {business_stockout_hours}/16h</span>
+                    <span class="evidence-pill">Peak {peak_hour:02d}:00</span>
+                </div>
+            </div>
+            <div class="evidence-card">
+                <div class="evidence-kicker">Daily totals for selected row</div>
+                <div class="card-stat-row">
+                    <div class="mini-stat"><div class="mini-label">Observed</div><div class="mini-value">{metric_value(observed_sales)}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Estimated</div><div class="mini-value">{metric_value(estimated_demand)}</div></div>
+                    <div class="mini-stat"><div class="mini-label">Recovered gap</div><div class="mini-value">{metric_value(lost_sales)}</div></div>
+                </div>
+                <div class="evidence-copy">{escape(str(selected_row['decision_reason']))}</div>
+            </div>
+        </div>
+        """
+    )
+    render_html(
+        f"""
+        <div class="section-card">
+            <div class="section-title">24-Hour Source Evidence</div>
+            <div class="section-subtitle">Each cell is one source hour. Red means the dataset says stockout; amber means recovered lost-sales signal; blue means normal observed demand evidence.</div>
+            <div class="hour-strip">{"".join(cells)}</div>
+            <div class="legend-row">
+                <span class="legend-item"><span class="legend-swatch" style="--swatch:#fecaca;"></span>Source stockout flag</span>
+                <span class="legend-item"><span class="legend-swatch" style="--swatch:#fde68a;"></span>Recovered lost-sales signal</span>
+                <span class="legend-item"><span class="legend-swatch" style="--swatch:#dbeafe;"></span>Observed demand carries estimate</span>
+            </div>
+        </div>
+        """
     )
 
 
@@ -668,6 +1494,12 @@ def main() -> None:
             "Review censored demand",
             "Maintain plan",
         ],
+        format_func=display_action_label,
+    )
+    queue_view = st.sidebar.selectbox(
+        "Action queue view",
+        ["Highest priority", "Diverse action sample", "Exclude full-stockout rows"],
+        help="Highest priority can be dominated by full-stockout days. Use the other views to inspect non-saturated examples.",
     )
     st.sidebar.divider()
     st.sidebar.caption("Recommended operating mode: use model-backed decisions for ranking, then inspect hourly drill-down before acting.")
@@ -680,8 +1512,15 @@ def main() -> None:
     summary = load_summary(where_sql, params).iloc[0]
     trend = load_trend(where_sql, params)
     category_summary = load_category_summary(where_sql, params)
-    recommendations = load_recommendations(where_sql, params)
-    score_columns = ["stockout_rate_6_22", "demand_bias_rate", "waste_risk_score", "restock_urgency_score"]
+    recommendations = load_recommendations(where_sql, params, queue_view)
+    score_columns = [
+        "stockout_rate_6_22",
+        "demand_bias_rate",
+        "waste_risk_score",
+        "restock_urgency_score",
+        "stockout_hours_6_22",
+        "observed_daily_sales_amount",
+    ]
     recommendations = coerce_numeric_columns(recommendations, score_columns)
 
     command_tab, actions_tab, trends_tab, drill_tab, quality_tab = st.tabs(
@@ -692,13 +1531,13 @@ def main() -> None:
         render_section_header("Executive KPIs", "Fast readout of stockout pressure, demand bias, lost sales, and operational queue size.")
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         with kpi1:
-            render_metric_card("Stockout rate", metric_value(summary["avg_stockout_rate_6_22"] * 100, "%"), "Average business-hour stockout pressure", "#dc2626")
+            render_metric_card("Stockout rate", metric_value(safe_float(summary.get("avg_stockout_rate_6_22")) * 100, "%"), "Average business-hour stockout pressure", "#dc2626")
         with kpi2:
             render_metric_card("Estimated lost sales", metric_value(summary["estimated_lost_sales"]), "Recovered demand not captured by observed sales", "#f59e0b")
         with kpi3:
             render_metric_card("Immediate restocks", metric_value(summary["immediate_restock_count"]), "Rows crossing urgent action threshold", "#2563eb")
         with kpi4:
-            render_metric_card("Avg urgency", metric_value(summary["avg_restock_urgency_score"] * 100, "%"), "Composite DSS priority score", "#7c3aed")
+            render_metric_card("Avg urgency", metric_value(safe_float(summary.get("avg_restock_urgency_score")) * 100, "%"), "Composite DSS priority score", "#7c3aed")
 
         kpi5, kpi6, kpi7, kpi8 = st.columns(4)
         with kpi5:
@@ -706,9 +1545,9 @@ def main() -> None:
         with kpi6:
             render_metric_card("Estimated demand", metric_value(summary["estimated_true_demand"]), "Observed plus recovered demand", "#1e40af")
         with kpi7:
-            render_metric_card("Demand bias", metric_value(summary["avg_demand_bias_rate"] * 100, "%"), "Sales understatement from censoring", "#ea580c")
+            render_metric_card("Lost demand share", metric_value(safe_float(summary.get("avg_demand_bias_rate")) * 100, "%"), "Estimated demand hidden by stockouts", "#ea580c")
         with kpi8:
-            render_metric_card("Waste risk", metric_value(summary["avg_waste_risk_score"] * 100, "%"), "Slow-moving proxy risk", "#4f46e5")
+            render_metric_card("Waste risk", metric_value(safe_float(summary.get("avg_waste_risk_score")) * 100, "%"), "Slow-moving proxy risk", "#4f46e5")
 
         render_action_grid(summary)
 
@@ -724,31 +1563,35 @@ def main() -> None:
         what4.metric("Restock Qty Proxy", metric_value(what_if["restock_order_qty_proxy"]))
 
     with actions_tab:
-        render_section_header("Prioritized Action Queue", "Ranked store-product-date recommendations with explainable reasons and risk scores.")
+        render_section_header("Action Intelligence", "Operational lanes and priority cards for deciding where to intervene first.")
         if recommendations.empty:
             st.info("No recommendations match the current filters.")
         else:
-            st.download_button(
-                "Download filtered action queue",
-                recommendations.to_csv(index=False).encode("utf-8"),
-                file_name="fresh_retail_dss_actions.csv",
-                mime="text/csv",
-            )
-            st.dataframe(
-                recommendations,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "stockout_rate_6_22": st.column_config.ProgressColumn("Stockout 6-21", min_value=0, max_value=1),
-                    "demand_bias_rate": st.column_config.ProgressColumn("Demand Bias", min_value=0, max_value=1),
-                    "waste_risk_score": st.column_config.ProgressColumn("Waste Risk", min_value=0, max_value=1),
-                    "restock_urgency_score": st.column_config.ProgressColumn("Restock Urgency", min_value=0, max_value=1),
-                    "observed_daily_sales_amount": st.column_config.NumberColumn("Observed Sales", format="%.3f"),
-                    "estimated_true_demand": st.column_config.NumberColumn("Estimated Demand", format="%.3f"),
-                    "estimated_lost_sales": st.column_config.NumberColumn("Lost Sales", format="%.3f"),
-                    "recommended_order_qty": st.column_config.NumberColumn("Order Proxy", format="%.3f"),
-                },
-            )
+            render_queue_insight(summary, recommendations, queue_view)
+            render_action_lanes(recommendations)
+            render_priority_cards(recommendations)
+            with st.expander("Raw queue data and export"):
+                st.download_button(
+                    "Download filtered action queue",
+                    recommendations.to_csv(index=False).encode("utf-8"),
+                    file_name="fresh_retail_dss_actions.csv",
+                    mime="text/csv",
+                )
+                st.dataframe(
+                    recommendations,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "stockout_rate_6_22": st.column_config.ProgressColumn("Business-hour Stockout", min_value=0, max_value=1),
+                        "demand_bias_rate": st.column_config.ProgressColumn("Lost Demand Share", min_value=0, max_value=1),
+                        "waste_risk_score": st.column_config.ProgressColumn("Waste Risk", min_value=0, max_value=1),
+                        "restock_urgency_score": st.column_config.ProgressColumn("Priority Score", min_value=0, max_value=1),
+                        "observed_daily_sales_amount": st.column_config.NumberColumn("Observed Sales", format="%.3f"),
+                        "estimated_true_demand": st.column_config.NumberColumn("Estimated Demand", format="%.3f"),
+                        "estimated_lost_sales": st.column_config.NumberColumn("Lost Sales", format="%.3f"),
+                        "recommended_order_qty": st.column_config.NumberColumn("Order Proxy", format="%.3f"),
+                    },
+                )
 
     with trends_tab:
         trend_left, trend_right = st.columns([1.35, 1])
@@ -768,7 +1611,9 @@ def main() -> None:
                 chart_df = coerce_numeric_columns(category_summary, category_columns)
                 chart_df["first_category_id"] = chart_df["first_category_id"].astype(str)
                 st.bar_chart(chart_df, x="first_category_id", y=category_columns, height=360)
-                st.dataframe(chart_df, width="stretch", hide_index=True)
+                render_category_cards(chart_df)
+                with st.expander("Category table"):
+                    st.dataframe(chart_df, width="stretch", hide_index=True)
             else:
                 st.info("No category data for the selected filters.")
 
@@ -785,28 +1630,43 @@ def main() -> None:
                     f"{recommendation_options.loc[idx, 'full_date']} | "
                     f"store {int(recommendation_options.loc[idx, 'store_id'])} | "
                     f"product {int(recommendation_options.loc[idx, 'product_id'])} | "
-                    f"{recommendation_options.loc[idx, 'decision_action']}"
+                    f"{display_action_label(recommendation_options.loc[idx, 'decision_action'])}"
                 ),
             )
             selected_row = recommendation_options.loc[selected_index]
-            detail1, detail2, detail3, detail4 = st.columns(4)
-            detail1.metric("Store", int(selected_row["store_id"]))
-            detail2.metric("Product", int(selected_row["product_id"]))
-            detail3.metric("Action", selected_row["decision_action"])
-            detail4.metric("Urgency", metric_value(float(selected_row["restock_urgency_score"]) * 100, "%"))
-            st.caption(str(selected_row["decision_reason"]))
+            render_selection_overview(selected_row)
             hourly = load_hourly_drilldown(selected_row["full_date"], int(selected_row["store_id"]), int(selected_row["product_id"]))
             if hourly.empty:
                 st.info("Hourly fact rows are not loaded for this recommendation. Re-run ETL with `--load-hourly` to enable drill-down.")
             else:
                 hourly_numeric = coerce_numeric_columns(hourly, ["observed_sales_amount", "estimated_true_demand", "estimated_lost_sales", "stockout_flag"])
                 hourly_numeric["hour_of_day"] = hourly_numeric["hour_of_day"].astype(int)
-                line_col, stock_col = st.columns([1.4, 1])
-                with line_col:
-                    st.line_chart(hourly_numeric, x="hour_of_day", y=["observed_sales_amount", "estimated_true_demand", "estimated_lost_sales"], height=360)
-                with stock_col:
-                    st.bar_chart(hourly_numeric, x="hour_of_day", y="stockout_flag", height=360)
-                st.dataframe(hourly, width="stretch", hide_index=True)
+                render_hourly_story(selected_row, hourly_numeric)
+                business_hours = hourly_numeric[(hourly_numeric["hour_of_day"] >= 6) & (hourly_numeric["hour_of_day"] <= 21)]
+                if not business_hours.empty and business_hours["stockout_flag"].eq(1).all():
+                    st.info(
+                        "The selected recommendation is a full business-hour stockout in the source data. "
+                        "The stockout bars are therefore all 1 for hours 6-21; this is an observed stockout flag, not a model prediction."
+                    )
+                render_section_header("Demand Recovery Chart", "Orange bars show recovered lost sales. Blue dashed line is estimated demand. Gray line is observed sales.")
+                render_hourly_evidence_chart(hourly_numeric)
+                evidence_table = prepare_hourly_evidence_table(hourly_numeric)
+                with st.expander("Hour-by-hour evidence table", expanded=True):
+                    st.dataframe(
+                        evidence_table,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "observed_sales_amount": st.column_config.NumberColumn("Observed sales", format="%.4f"),
+                            "estimated_true_demand": st.column_config.NumberColumn("Estimated demand", format="%.4f"),
+                            "estimated_lost_sales": st.column_config.NumberColumn("Recovered lost sales", format="%.4f"),
+                            "stockout_flag": st.column_config.CheckboxColumn("Stockout flag"),
+                            "estimate_source": st.column_config.TextColumn("Estimate source"),
+                        },
+                    )
+                    st.markdown('<div class="evidence-table-note">Use this table to verify whether the recommendation comes from observed sales, source stockout flags, or recovered demand estimates.</div>', unsafe_allow_html=True)
+                with st.expander("Raw hourly rows"):
+                    st.dataframe(hourly, width="stretch", hide_index=True)
 
     with quality_tab:
         model_col, data_col = st.columns([1.15, 1])
@@ -824,18 +1684,33 @@ def main() -> None:
                 mq4.metric("Calibration", metric_value_precise(quality["calibration_factor"], 4))
                 mq5.metric("MAE", metric_value_precise(quality["mae"], 4))
                 mq6.metric("RMSE", metric_value_precise(quality["rmse"], 4))
+                raw_calibration = quality.get("raw_calibration_factor")
+                if pd.notna(raw_calibration) and pd.notna(quality["calibration_factor"]):
+                    raw_factor = float(raw_calibration)
+                    applied_factor = float(quality["calibration_factor"])
+                    if abs(raw_factor - applied_factor) > 0.0001:
+                        st.warning(
+                            f"Calibration was capped: raw factor {raw_factor:.4f}, applied factor {applied_factor:.4f}. "
+                            "The negative bias means the capped DSS estimate is underpredicting aggregate eval demand, but it avoids extreme order inflation."
+                        )
                 if pd.notna(quality["wmape"]) and float(quality["wmape"]) >= 0.8:
                     st.warning("Model error is high. Use recommendations as risk ranking and decision support, not exact order optimization.")
+                if pd.notna(quality["calibration_factor"]) and float(quality["calibration_factor"]) >= 5:
+                    st.warning("Calibration factor is very high. Lost-sales quantities may be inflated; prefer capped calibration or a larger/more representative training sample.")
                 if pd.notna(quality["bias"]) and abs(float(quality["bias"])) <= 0.05:
                     st.success("Aggregate demand bias is within +/-5%, suitable for DSS-level lost-sales and action-priority reporting.")
-                st.dataframe(model_quality, width="stretch", hide_index=True)
+                elif pd.notna(quality["bias"]):
+                    st.error("Aggregate demand bias is outside +/-5%. Treat quantities as conservative risk proxies, not calibrated demand forecasts.")
+                with st.expander("Model quality table"):
+                    st.dataframe(model_quality, width="stretch", hide_index=True)
         with data_col:
             render_section_header("Warehouse Quality", "Data contract checks for arrays, grain, and stockout-count consistency.")
             if failed_checks.empty:
                 st.success("All loaded warehouse quality checks passed.")
             else:
                 st.error(f"{len(failed_checks)} quality check(s) failed.")
-            st.dataframe(quality_checks, width="stretch", hide_index=True)
+            with st.expander("Warehouse quality table"):
+                st.dataframe(quality_checks, width="stretch", hide_index=True)
 
         with st.expander("How DSS scores are calculated"):
             st.markdown(
