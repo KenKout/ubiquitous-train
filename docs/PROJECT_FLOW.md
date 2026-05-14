@@ -368,6 +368,7 @@ flowchart TD
 4. The daily fact grain is one row per `store`, `product`, `date`.
 5. The hourly fact grain is one row per `store`, `product`, `date`, `hour`.
 6. Hourly loading is optional because full data expands to about `116.4M` rows.
+7. Local model samples should use seeded `store-product-panel` loading so selected pairs keep complete train histories and matched future eval rows.
 
 ### ETL Commands
 
@@ -389,6 +390,18 @@ Fast demo load with hourly fact:
 python3 etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 10000 --load-hourly
 ```
 
+Recommended local model panel load:
+
+```bash
+uv run python etl/load_fresh_retail_dw.py \
+  --reset \
+  --train-limit-rows 100000 \
+  --staging-sample-mode store-product-panel \
+  --panel-seed 42 \
+  --load-hourly \
+  --hourly-workers 4
+```
+
 Full daily warehouse:
 
 ```bash
@@ -403,14 +416,15 @@ python3 etl/load_fresh_retail_dw.py --reset --load-hourly
 
 ### Current Demo Load Options
 
-The repository supports two practical warehouse load sizes:
+The repository supports fast symmetric demo loads and the panel load used for local model evaluation:
 
 | Mode | Command Shape | Total Daily Rows | Total Hourly Rows |
 |---|---|---:|---:|
 | Fast demo | `--limit-rows-per-split 1000 --load-hourly` | 2,000 | 48,000 |
 | Larger practical sample | `--limit-rows-per-split 10000 --load-hourly` | 20,000 | 480,000 |
+| Local model panel | `--train-limit-rows 100000 --staging-sample-mode store-product-panel --panel-seed 42 --load-hourly` | about 107,767 | about 2,586,408 |
 
-The fast demo is intended for quick rebuilds during development. The larger sample is still manageable on a laptop and gives the model a broader training base.
+The fast demo is intended for quick rebuilds during development. The panel sample is better for local modeling because every selected `store_id + product_id` keeps all 90 train dates and the matching 7 future eval dates.
 
 ## 9. DSS Views Before Model Training
 
@@ -545,43 +559,49 @@ The SQL heuristic baseline remains the explainable fallback when no model predic
 ### Training Command
 
 ```bash
-python3 ml/train_xgboost_demand_model.py --load-predictions
+uv run python ml/train_xgboost_demand_model.py \
+  --model-type xgboost \
+  --model-strategy hurdle \
+  --model-name xgboost_demand_m1_hurdle \
+  --model-version m1_panel100k_seed42_full_eval \
+  --max-train-rows 2400000 \
+  --n-estimators 300 \
+  --max-depth 6 \
+  --learning-rate 0.05 \
+  --n-jobs 8 \
+  --prior-blend-weight 0.5 \
+  --calibration-objective balanced \
+  --calibration-bias-penalty 0.25 \
+  --max-calibration-factor 5 \
+  --load-predictions
 ```
 
-For larger training:
+Do not pass `--max-eval-rows` for the final local evaluation. The trainer uses eval rows only for final metrics and uses a train-only temporal holdout for calibration.
+
+For smoke tests only:
 
 ```bash
-python3 ml/train_xgboost_demand_model.py --max-train-rows 1000000 --load-predictions
+uv run python ml/train_xgboost_demand_model.py --max-train-rows 2000 --max-eval-rows 1000 --n-estimators 5
 ```
 
 ## 12. Current Model Evaluation
 
 The current DSS model layer is integrated and runnable, but model quality is still experimental.
 
-Current quick warehouse model metadata:
+Recommended local model metadata:
 
 | Field | Value |
 |---|---|
-| `model_name` | `xgboost_demand_fast` |
-| `model_version` | `smoke_m1` |
+| `model_name` | `xgboost_demand_m1_hurdle` |
+| `model_version` | `m1_panel100k_seed42_full_eval` |
 | Training start | 2024-03-28 |
 | Training end | 2024-06-25 |
 
 Important evaluation caveat:
 
 ```text
-Model metrics are evaluated only on non-stockout rows because true demand during stockout is unobserved. The model is suitable for demonstrating warehouse-to-DSS integration, not production-grade ordering optimization.
+Model metrics are evaluated only on non-stockout eval rows because true demand during stockout is unobserved. Eval is a future split; it is not used to fit the model or choose calibration.
 ```
-
-Current M1 smoke XGBoost metrics:
-
-| Metric | Value |
-|---|---:|
-| Evaluation rows | 5,000 |
-| MAE | 0.0603 |
-| RMSE | 0.0974 |
-| WMAPE | 1.2536 |
-| Bias | -17.78% |
 
 Best local RetailForecast-style replication result:
 
@@ -594,8 +614,8 @@ See `docs/EVALUATION.md` for the full model comparison.
 Artifacts:
 
 ```text
-models/xgboost_demand_fast_smoke_m1.pkl
-models/xgboost_demand_fast_smoke_m1_metrics.json
+models/xgboost_demand_m1_hurdle_m1_panel100k_seed42_full_eval.pkl
+models/xgboost_demand_m1_hurdle_m1_panel100k_seed42_full_eval_metrics.json
 ```
 
 ## 13. Model Output Storage
@@ -614,12 +634,12 @@ flowchart LR
     G --> H[Streamlit Dashboard]
 ```
 
-Current model output counts:
+Expected panel model output counts:
 
 | Table | Rows |
 |---|---:|
-| `dw.fact_demand_estimate_hourly` | 480,000 |
-| `dw.fact_replenishment_recommendation_daily` | 20,000 |
+| `dw.fact_demand_estimate_hourly` | about 2,586,408 |
+| `dw.fact_replenishment_recommendation_daily` | about 107,767 |
 
 ### Hourly Prediction Fact
 
@@ -843,24 +863,35 @@ Start PostgreSQL:
 docker compose up -d postgres
 ```
 
-Load fast demo warehouse with hourly facts:
+Load the recommended local model panel with hourly facts:
 
 ```bash
-python3 etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 1000 --load-hourly
+uv run python etl/load_fresh_retail_dw.py \
+  --reset \
+  --train-limit-rows 100000 \
+  --staging-sample-mode store-product-panel \
+  --panel-seed 42 \
+  --load-hourly \
+  --hourly-workers 4
 ```
 
 Train model and store DSS predictions:
 
 ```bash
-python3 ml/train_xgboost_demand_model.py \
+uv run python ml/train_xgboost_demand_model.py \
   --model-type xgboost \
-  --model-name xgboost_demand_fast \
-  --model-version fast_sample \
-  --n-estimators 120 \
+  --model-strategy hurdle \
+  --model-name xgboost_demand_m1_hurdle \
+  --model-version m1_panel100k_seed42_full_eval \
+  --max-train-rows 2400000 \
+  --n-estimators 300 \
   --max-depth 6 \
-  --learning-rate 0.08 \
-  --max-train-rows 24000 \
-  --max-eval-rows 24000 \
+  --learning-rate 0.05 \
+  --n-jobs 8 \
+  --prior-blend-weight 0.5 \
+  --calibration-objective balanced \
+  --calibration-bias-penalty 0.25 \
+  --max-calibration-factor 5 \
   --load-predictions
 ```
 
@@ -909,14 +940,14 @@ Current state:
 
 Demo limitation:
 
-The current fast demo warehouse uses `1,000` rows from train and `1,000` rows from eval. This is enough to demonstrate the complete flow quickly. A larger `10,000` rows per split sample is better for a presentation if runtime allows.
+Fast symmetric demo loads such as `--limit-rows-per-split 1000` are enough to demonstrate the complete flow quickly, but they are not the preferred model evaluation setup. The recommended local model run uses a seeded store-product panel so every selected pair has continuous train history and matching future eval rows.
 
 Recommended practical run:
 
 ```bash
-python3 etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 10000 --load-hourly
-python3 ml/train_xgboost_demand_model.py --model-type catboost --model-name catboost_latent_demand --model-version practical_sample --n-estimators 200 --max-train-rows 240000 --max-eval-rows 240000 --load-predictions
-streamlit run app/dss_dashboard.py
+uv run python etl/load_fresh_retail_dw.py --reset --train-limit-rows 100000 --staging-sample-mode store-product-panel --panel-seed 42 --load-hourly --hourly-workers 4
+uv run python ml/train_xgboost_demand_model.py --model-type xgboost --model-strategy hurdle --model-name xgboost_demand_m1_hurdle --model-version m1_panel100k_seed42_full_eval --max-train-rows 2400000 --n-estimators 300 --max-depth 6 --learning-rate 0.05 --n-jobs 8 --prior-blend-weight 0.5 --calibration-objective balanced --calibration-bias-penalty 0.25 --max-calibration-factor 5 --load-predictions
+uv run streamlit run app/dss_dashboard.py
 ```
 
 ## 20. Summary

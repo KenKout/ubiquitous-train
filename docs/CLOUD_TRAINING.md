@@ -4,13 +4,12 @@ Use Kaggle or Colab for the expensive model step only. Keep PostgreSQL and the S
 
 ## 1. Recommended Scale
 
-Use `100,000` daily rows per split when runtime allows:
+For local-to-cloud experiments, prefer a seeded store-product panel instead of independent row caps. This keeps complete 90-day train histories and the matching 7-day future eval panel.
 
-| Rows per split | Total daily rows | Hourly feature rows |
-|---:|---:|---:|
-| 10,000 | 20,000 | 480,000 |
-| 50,000 | 100,000 | 2,400,000 |
-| 100,000 | 200,000 | 4,800,000 |
+| Load mode | Train daily rows | Eval daily rows | Hourly feature rows |
+|---|---:|---:|---:|
+| `--train-limit-rows 100000 --staging-sample-mode store-product-panel --panel-seed 42` | about 99,990 | about 7,777 | about 2,586,408 |
+| `--limit-rows-per-split 100000` legacy symmetric cap | 100,000 | 100,000 | 4,800,000 |
 
 Do not use `100k` boosting rounds. For XGBoost/CatBoost, start with `600` to `1000` trees on GPU.
 
@@ -19,13 +18,15 @@ Do not use `100k` boosting rounds. For XGBoost/CatBoost, start with `600` to `10
 ```bash
 uv run python etl/load_fresh_retail_dw.py \
   --reset \
-  --limit-rows-per-split 100000 \
+  --train-limit-rows 100000 \
+  --staging-sample-mode store-product-panel \
+  --panel-seed 42 \
   --load-hourly \
   --hourly-workers 4
 ```
 
-This creates about `4.8M` hourly rows. If that is too slow, use `50000` or `10000` first.
-For `1000000` rows per split on Colab, keep `--hourly-workers 4` and avoid increasing workers unless disk write throughput remains stable.
+This creates about `2.59M` hourly rows for the selected train/eval panel. If that is too slow, use `50000` or `10000` first.
+If using a larger legacy symmetric cap on Colab, keep `--hourly-workers 4` and avoid increasing workers unless disk write throughput remains stable.
 
 ## 3. Local: Export Model Features
 

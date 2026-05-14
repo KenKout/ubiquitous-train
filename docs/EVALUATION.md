@@ -38,7 +38,17 @@ Current checks:
 | `business_hour_stockout_count_matches` | `stock_hour6_22_cnt` equals stockout flags from hours 6 through 21 |
 | `duplicate_staging_grain` | Staging grain remains `source_split, store_id, product_id, dt` |
 
-All checks passed on the current loaded 2,000-row demo warehouse.
+For local model evaluation, load a seeded store-product panel so selected pairs have continuous train history and matched future eval rows:
+
+```bash
+uv run python etl/load_fresh_retail_dw.py \
+  --reset \
+  --train-limit-rows 100000 \
+  --staging-sample-mode store-product-panel \
+  --panel-seed 42 \
+  --load-hourly \
+  --hourly-workers 4
+```
 
 ## 3. Model Evaluation
 
@@ -65,25 +75,22 @@ If stockout_flag = true:
     estimated_true_demand = max(observed_sales_amount, predicted_demand)
 ```
 
-Metrics are evaluated on non-stockout eval rows because those are the rows where observed sales are usable labels.
+Metrics are evaluated on non-stockout eval rows because those are the rows where observed sales are usable labels. The local trainer reserves a temporal holdout from the train split for calibration; `eval.parquet` is not used to fit the model or choose the calibration factor.
 
-Current M1 smoke run:
+Recommended local model run:
 
-| Metric | Value |
-|---|---:|
-| Model | `xgboost_demand_fast` |
-| Version | `smoke_m1` |
-| Evaluation rows | 5,000 |
-| MAE | 0.0603 |
-| RMSE | 0.0974 |
-| WMAPE | 1.2536 |
-| Bias | -17.78% |
+| Field | Value |
+|---|---|
+| Model | `xgboost_demand_m1_hurdle` |
+| Version | `m1_panel100k_seed42_full_eval` |
+| Train source | Selected store-product panel from `train.parquet` |
+| Eval source | Matched future panel from `eval.parquet` |
+| Calibration source | Train-only temporal holdout |
 
 Interpretation:
 
 ```text
-This is a fast validation model, not the final forecasting result.
-It proves the M1-friendly training path and warehouse prediction load work end to end.
+The run proves the M1-friendly training path, train-only calibration, future eval evaluation, and warehouse prediction load work end to end.
 ```
 
 ## 4. DSS Evaluation
@@ -135,17 +142,24 @@ This is the safest fast path on an M1 MacBook. CUDA-based GPU training is not ap
 ## 6. Recommended Demo Command
 
 ```bash
-python3 ml/train_xgboost_demand_model.py \
+uv run python ml/train_xgboost_demand_model.py \
   --model-type xgboost \
-  --model-name xgboost_demand_fast \
-  --model-version fast_sample \
-  --n-estimators 120 \
+  --model-strategy hurdle \
+  --model-name xgboost_demand_m1_hurdle \
+  --model-version m1_panel100k_seed42_full_eval \
+  --max-train-rows 2400000 \
+  --n-estimators 300 \
   --max-depth 6 \
-  --learning-rate 0.08 \
-  --max-train-rows 24000 \
-  --max-eval-rows 24000 \
+  --learning-rate 0.05 \
+  --n-jobs 8 \
+  --prior-blend-weight 0.5 \
+  --calibration-objective balanced \
+  --calibration-bias-penalty 0.25 \
+  --max-calibration-factor 5 \
   --load-predictions
 ```
+
+Do not pass `--max-eval-rows` for the final local evaluation. Use it only for smoke tests.
 
 ## 7. Report Wording
 

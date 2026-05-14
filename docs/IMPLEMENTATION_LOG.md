@@ -112,22 +112,35 @@ Start PostgreSQL:
 docker compose up -d postgres
 ```
 
-Load the fast demo warehouse:
+Load the recommended local model panel:
 
 ```bash
-python3 etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 1000 --load-hourly
+uv run python etl/load_fresh_retail_dw.py \
+  --reset \
+  --train-limit-rows 100000 \
+  --staging-sample-mode store-product-panel \
+  --panel-seed 42 \
+  --load-hourly \
+  --hourly-workers 4
 ```
 
 Train a model and load predictions:
 
 ```bash
-python3 ml/train_xgboost_demand_model.py \
+uv run python ml/train_xgboost_demand_model.py \
   --model-type xgboost \
-  --model-name xgboost_demand_fast \
-  --model-version fast_sample \
-  --n-estimators 120 \
-  --max-train-rows 24000 \
-  --max-eval-rows 24000 \
+  --model-strategy hurdle \
+  --model-name xgboost_demand_m1_hurdle \
+  --model-version m1_panel100k_seed42_full_eval \
+  --max-train-rows 2400000 \
+  --n-estimators 300 \
+  --max-depth 6 \
+  --learning-rate 0.05 \
+  --n-jobs 8 \
+  --prior-blend-weight 0.5 \
+  --calibration-objective balanced \
+  --calibration-bias-penalty 0.25 \
+  --max-calibration-factor 5 \
   --load-predictions
 ```
 

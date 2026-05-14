@@ -80,15 +80,21 @@ For a larger but still practical sample, use 10,000 rows per split:
 python3 etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 10000 --load-hourly
 ```
 
-For Colab or larger local machines, use parallel hourly expansion. Start with 4 workers; increase only if PostgreSQL and disk writes remain stable:
+For local model iteration, cap the training split by choosing seeded `store_id + product_id` panels. This keeps complete histories for selected pairs and loads the matching future eval rows for those same pairs:
 
 ```bash
 uv run python etl/load_fresh_retail_dw.py \
   --reset \
-  --limit-rows-per-split 1000000 \
+  --train-limit-rows 100000 \
+  --staging-sample-mode store-product-panel \
+  --panel-seed 42 \
   --load-hourly \
   --hourly-workers 4
 ```
+
+`--limit-rows-per-split` is still available for symmetric demo loads, but it caps both train and eval independently. Do not use it for the local model workflow when eval should be the matched future panel.
+
+Panel mode treats `--train-limit-rows` as a target because it preserves complete store-product histories. With the current dataset, `100000` selects `1,111` store-product pairs, which yields `99,990` train daily rows and `7,777` matched future eval daily rows before hourly expansion.
 
 You can also restrict hourly expansion to a date window while keeping loaded staging/daily data:
 
@@ -143,18 +149,23 @@ The basic DSS can fall back to heuristic demand recovery, but real decisions sho
 
 When `--load-predictions` is not used, the dashboard still works by reading the heuristic fallback views in PostgreSQL. When predictions are loaded, it automatically uses the latest trained model registered in `dw.dim_model`.
 
-For the fast demo warehouse, train the M1-friendly XGBoost CPU histogram model and load predictions:
+For the local warehouse, train the M1-friendly XGBoost CPU histogram model and load predictions. Do not pass `--max-eval-rows` unless you intentionally want a smoke test; by default all loaded eval rows are used only for final future evaluation:
 
 ```bash
-python3 ml/train_xgboost_demand_model.py \
+uv run python ml/train_xgboost_demand_model.py \
   --model-type xgboost \
-  --model-name xgboost_demand_fast \
-  --model-version fast_sample \
-  --n-estimators 120 \
+  --model-strategy hurdle \
+  --model-name xgboost_demand_m1_hurdle \
+  --model-version m1_panel100k_seed42_full_eval \
+  --max-train-rows 2400000 \
+  --n-estimators 300 \
   --max-depth 6 \
-  --learning-rate 0.08 \
-  --max-train-rows 24000 \
-  --max-eval-rows 24000 \
+  --learning-rate 0.05 \
+  --n-jobs 8 \
+  --prior-blend-weight 0.5 \
+  --calibration-objective balanced \
+  --calibration-bias-penalty 0.25 \
+  --max-calibration-factor 5 \
   --load-predictions
 ```
 
@@ -189,7 +200,7 @@ The dashboard automatically uses the latest trained model from `dw.dim_model` wh
 For larger samples, keep PostgreSQL local and send a parquet feature export to Kaggle/Colab:
 
 ```bash
-uv run python etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 100000 --load-hourly
+uv run python etl/load_fresh_retail_dw.py --reset --train-limit-rows 100000 --staging-sample-mode store-product-panel --panel-seed 42 --load-hourly --hourly-workers 4
 
 uv run python ml/export_model_features.py \
   --output exports/freshretail_features_100k.parquet
