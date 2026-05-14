@@ -157,6 +157,41 @@ Outputs:
 
 The dashboard automatically uses the latest trained model from `dw.dim_model` when predictions exist.
 
+## Train On Kaggle Or Colab GPU
+
+For larger samples, keep PostgreSQL local and send a parquet feature export to Kaggle/Colab:
+
+```bash
+uv run python etl/load_fresh_retail_dw.py --reset --limit-rows-per-split 100000 --load-hourly
+
+uv run python ml/export_model_features.py \
+  --output exports/freshretail_features_100k.parquet
+```
+
+On Kaggle/Colab, train with:
+
+```bash
+python ml/cloud_gpu_train.py \
+  --features /path/to/freshretail_features_100k.parquet \
+  --output-dir cloud_outputs \
+  --device cuda \
+  --model-name kaggle_xgboost_gpu \
+  --model-version v1 \
+  --n-estimators 800
+```
+
+Then import the downloaded predictions locally:
+
+```bash
+uv run python ml/import_cloud_predictions.py \
+  --predictions exports/kaggle_xgboost_gpu_v1_predictions.parquet \
+  --model-name kaggle_xgboost_gpu \
+  --model-version v1 \
+  --replace-model-output
+```
+
+Use `100000` as daily rows per split, not `100000` boosting rounds. Start with `600-1000` trees for GPU training. See `docs/CLOUD_TRAINING.md` for the full workflow.
+
 Evaluation note:
 
 ```text
@@ -169,6 +204,7 @@ See detailed documentation:
 - `docs/ARCHITECTURE.md`
 - `docs/PROJECT_FLOW.md`
 - `docs/EVALUATION.md`
+- `docs/CLOUD_TRAINING.md`
 
 ## Data Model
 

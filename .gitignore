@@ -34,6 +34,7 @@ data/
 
 # Generated model artifacts
 models/
+exports/
 *.pkl
 *.pickle
 *.joblib
